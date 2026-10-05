@@ -28,7 +28,15 @@ type client struct {
 	t      *testing.T
 	h      http.Handler
 	tenant string // sent as X-Tenant-Schema when set
+
+	// refs, when set, are added to POST /jobs and POST /estimates bodies (and a
+	// start time and length to jobs and approvals) that do not carry them, so
+	// tests about something else need not spell them out.
+	refs *refIDs
 }
+
+// refIDs are the ids of a customer, one of its locations and a service type.
+type refIDs struct{ customer, location, serviceType string }
 
 type resp struct {
 	code int
@@ -48,6 +56,7 @@ func (r resp) list() []any {
 
 func (c client) do(method, path, body string) resp {
 	c.t.Helper()
+	body = c.fill(method, path, body)
 	req := httptest.NewRequest(method, path, strings.NewReader(body))
 	if body != "" {
 		req.Header.Set("Content-Type", "application/json")
@@ -70,7 +79,9 @@ func newClient(t *testing.T) (client, *gorm.DB, string) {
 	t.Helper()
 	db := helpers.Connect(t)
 	schema, _ := helpers.NewSchema(t, db)
-	return client{t: t, h: app.NewServer(db, schema)}, db, schema
+	c := client{t: t, h: app.NewServer(db, schema)}
+	c.refs = seedRefs(t, c)
+	return c, db, schema
 }
 
 func (r resp) expect(t *testing.T, code int) resp {
@@ -328,6 +339,7 @@ func TestE2ETenantIsolation(t *testing.T) {
 	h := app.NewServer(db, schemaA)
 	inA := client{t: t, h: h}
 	inB := client{t: t, h: h, tenant: schemaB}
+	inA.refs, inB.refs = seedRefs(t, inA), seedRefs(t, inB)
 
 	id, _ := inB.post("/jobs", `{"date":"2026-10-02"}`).expect(t, 200).obj()["id"].(string)
 	inB.get("/jobs/"+id+"/schedule").expect(t, 200)
@@ -399,7 +411,9 @@ func TestE2EInternalErrorsDoNotLeak(t *testing.T) {
 	schema, _ := helpers.NewSchema(t, admin)
 	db := helpers.Connect(t) // the server's own connection, which this test breaks
 	h := app.NewServer(db, schema)
-	client{t: t, h: h}.post("/jobs", `{"date":"2026-10-02"}`).expect(t, 200)
+	good := client{t: t, h: h}
+	good.refs = seedRefs(t, good)
+	good.post("/jobs", `{"date":"2026-10-02"}`).expect(t, 200)
 
 	sqlDB, err := db.DB()
 	if err != nil {
@@ -408,7 +422,7 @@ func TestE2EInternalErrorsDoNotLeak(t *testing.T) {
 	_ = sqlDB.Close() // every later query fails with a driver error
 
 	for name, r := range map[string]resp{
-		"create":   client{t: t, h: h}.post("/jobs", `{"date":"2026-10-02"}`),
+		"create":   client{t: t, h: h}.post("/jobs", fullJobBody),
 		"schedule": client{t: t, h: h}.get("/jobs/" + unknownID + "/schedule"),
 		"patch":    client{t: t, h: h}.patch("/jobs/"+unknownID+"/occurrences/2026-10-02", `{"status":"confirmed"}`),
 	} {
@@ -419,3 +433,56 @@ func TestE2EInternalErrorsDoNotLeak(t *testing.T) {
 		r.envelope(t)
 	}
 }
+
+// fill adds the client's references (and a start time and length) to the
+// request bodies that need them and lack them. Malformed bodies are left as
+// they are, so validation tests still see what they sent.
+func (c client) fill(method, path, body string) string {
+	if c.refs == nil || method != "POST" || body == "" {
+		return body
+	}
+	var add map[string]any
+	switch {
+	case path == "/jobs":
+		add = map[string]any{"customerId": c.refs.customer, "locationId": c.refs.location, "serviceTypeId": c.refs.serviceType, "startTime": "09:00", "lengthMinutes": 60}
+	case path == "/estimates":
+		add = map[string]any{"customerId": c.refs.customer, "locationId": c.refs.location, "serviceTypeId": c.refs.serviceType}
+	case strings.HasPrefix(path, "/estimates/") && strings.HasSuffix(path, "/approve"):
+		add = map[string]any{"startTime": "09:00", "lengthMinutes": 60}
+	default:
+		return body
+	}
+	var m map[string]any
+	if json.Unmarshal([]byte(body), &m) != nil || m == nil {
+		return body
+	}
+	for k, v := range add {
+		if _, has := m[k]; !has {
+			m[k] = v
+		}
+	}
+	out, err := json.Marshal(m)
+	if err != nil {
+		return body
+	}
+	return string(out)
+}
+
+// seedRefs creates a customer ("Ada Lovelace"), a location and a service type
+// through the API and returns their ids.
+func seedRefs(t *testing.T, c client) *refIDs {
+	t.Helper()
+	id := func(r resp) string {
+		t.Helper()
+		s, _ := r.expect(t, 200).obj()["id"].(string)
+		return s
+	}
+	customer := id(c.post("/customers", `{"name":"Ada Lovelace","email":"ada@example.com"}`))
+	location := id(c.post("/customers/"+customer+"/locations", `{"addressLine1":"1 Main Street","city":"Springfield"}`))
+	serviceType := id(c.post("/service-types", `{"name":"Window cleaning"}`))
+	return &refIDs{customer: customer, location: location, serviceType: serviceType}
+}
+
+// fullJobBody is a complete job request with made-up reference ids, for tests
+// that never get as far as looking them up.
+const fullJobBody = `{"customerId":"11111111-1111-1111-1111-111111111111","locationId":"22222222-2222-2222-2222-222222222222","serviceTypeId":"33333333-3333-3333-3333-333333333333","date":"2026-10-02","startTime":"09:00","lengthMinutes":60}`

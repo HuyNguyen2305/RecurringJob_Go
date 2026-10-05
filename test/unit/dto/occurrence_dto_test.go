@@ -1,6 +1,8 @@
 package dto_test
 
 import (
+	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -8,6 +10,27 @@ import (
 	"recurringjob/internal/dto"
 	"recurringjob/internal/model"
 )
+
+func TestOccurrenceResponsePaidInvoiceIDs(t *testing.T) {
+	t.Run("kept paid invoices are listed", func(t *testing.T) {
+		got := dto.NewOccurrenceResponse(&model.JobOccurrence{Status: "canceled", PaidInvoiceIDs: []string{"inv-1", "inv-2"}})
+		if len(got.PaidInvoiceIDs) != 2 || got.PaidInvoiceIDs[0] != "inv-1" {
+			t.Fatalf("got %+v", got.PaidInvoiceIDs)
+		}
+		raw, _ := json.Marshal(got)
+		if !strings.Contains(string(raw), `"paidInvoiceIds":["inv-1","inv-2"]`) {
+			t.Fatalf("json %s", raw)
+		}
+	})
+	t.Run("the field is left out when there is nothing to follow up", func(t *testing.T) {
+		for name, ids := range map[string][]string{"nil": nil, "empty": {}} {
+			raw, _ := json.Marshal(dto.NewOccurrenceResponse(&model.JobOccurrence{Status: "canceled", PaidInvoiceIDs: ids}))
+			if strings.Contains(string(raw), "paidInvoiceIds") {
+				t.Errorf("%s: json %s", name, raw)
+			}
+		}
+	})
+}
 
 func TestNewOccurrenceResponse(t *testing.T) {
 	t.Run("minimal row has null optionals", func(t *testing.T) {

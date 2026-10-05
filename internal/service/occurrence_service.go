@@ -49,10 +49,21 @@ type UpdateOccurrenceRequest struct {
 	RescheduledTo *time.Time
 }
 
+// InvoiceVoider handles the invoices of an occurrence that is canceled or
+// terminated. InvoiceService satisfies it.
+type InvoiceVoider interface {
+	// VoidUnpaidForOccurrence voids the draft and sent invoices and returns
+	// how many it voided.
+	VoidUnpaidForOccurrence(ctx context.Context, jobID string, date time.Time) (int64, error)
+	// PaidIDsForOccurrence returns the paid invoices, which stay as they are.
+	PaidIDsForOccurrence(ctx context.Context, jobID string, date time.Time) ([]string, error)
+}
+
 type OccurrenceService struct {
 	jobs     JobGetter
 	occs     OccurrenceRepository
 	resolver *OccurrenceResolver
+	invoices InvoiceVoider
 	now      func() time.Time
 }
 
@@ -63,6 +74,14 @@ func NewOccurrenceService(jobs JobGetter, occs OccurrenceRepository, resolver *O
 // WithClock replaces the clock used to decide what "today" is (for tests).
 func (s *OccurrenceService) WithClock(now func() time.Time) *OccurrenceService {
 	s.now = now
+	return s
+}
+
+// WithInvoices makes canceling or terminating an occurrence void its unpaid
+// invoices. It is set after construction because the invoice service itself
+// depends on this one. Without it invoices are not touched.
+func (s *OccurrenceService) WithInvoices(invoices InvoiceVoider) *OccurrenceService {
+	s.invoices = invoices
 	return s
 }
 
@@ -234,6 +253,16 @@ func (s *OccurrenceService) UpdateOccurrence(ctx context.Context, jobID string, 
 			}
 		} else if err := s.occs.Create(ctx, &saved); err != nil {
 			return err
+		}
+		if s.invoices != nil && (req.Status == StatusCanceled || req.Status == StatusTerminateService) {
+			if _, err := s.invoices.VoidUnpaidForOccurrence(ctx, jobID, date); err != nil {
+				return err
+			}
+			paid, err := s.invoices.PaidIDsForOccurrence(ctx, jobID, date)
+			if err != nil {
+				return err
+			}
+			saved.PaidInvoiceIDs = paid
 		}
 		if req.Status == StatusRescheduled {
 			return s.occs.Create(ctx, &model.JobOccurrence{

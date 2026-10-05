@@ -17,7 +17,8 @@ import (
 
 func buildJobs(db *gorm.DB) *service.JobService {
 	jobs := repository.NewJobRepository(db)
-	return service.NewJobService(jobs, service.NewOccurrenceResolver(jobs))
+	refs := service.NewReferences(repository.NewCustomerRepository(db), repository.NewLocationRepository(db), repository.NewServiceTypeRepository(db))
+	return service.NewJobService(jobs, service.NewOccurrenceResolver(jobs), refs)
 }
 
 func weeklyOn(day time.Time) *recurrence.Rule {
@@ -244,14 +245,84 @@ func TestIntegrationExceptFrequency(t *testing.T) {
 	})
 }
 
+func TestIntegrationCreateJobStoresCustomerLocationServiceAndTime(t *testing.T) {
+	db, ctx := helpers.NewTestDB(t)
+	jobs := buildJobs(db)
+	repo := repository.NewJobRepository(db)
+	r := helpers.RefsFor(t, ctx, db)
+	other := helpers.SeedRefs(t, ctx, db) // a second customer with its own location
+	date := civil.New(2026, 10, 2)
+	in := service.CreateJobInput{
+		CustomerID: r.CustomerID, LocationID: r.LocationID, ServiceTypeID: r.ServiceTypeID,
+		Date: date, StartTime: "09:30", LengthMinutes: 90,
+	}
+
+	t.Run("the job is stored with its references, time and length, and loads with their names", func(t *testing.T) {
+		job, err := jobs.CreateJob(ctx, in)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := repo.GetJob(ctx, job.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.CustomerID != r.CustomerID || got.LocationID != r.LocationID || got.ServiceTypeID != r.ServiceTypeID || got.LengthMinutes != 90 {
+			t.Fatalf("stored %+v", got)
+		}
+		if got.StartTime != "09:30:00" {
+			t.Fatalf("start time %q, want 09:30:00", got.StartTime)
+		}
+		if got.Customer == nil || got.Customer.Name != "Ada Lovelace" || got.Location == nil || got.Location.AddressLine1 != "1 Main Street" || got.ServiceType == nil || got.ServiceType.Name != "Window cleaning" {
+			t.Fatalf("references not loaded: %+v %+v %+v", got.Customer, got.Location, got.ServiceType)
+		}
+	})
+
+	t.Run("references that do not fit are refused and leave nothing behind", func(t *testing.T) {
+		before := helpers.Scalar(t, ctx, db, `SELECT count(*) FROM jobs`)
+		tests := []struct {
+			name   string
+			mutate func(c *service.CreateJobInput)
+			want   int
+		}{
+			{"another customer's location", func(c *service.CreateJobInput) { c.LocationID = other.LocationID }, 400},
+			{"unknown customer", func(c *service.CreateJobInput) { c.CustomerID = "00000000-0000-0000-0000-0000000000ff" }, 404},
+			{"unknown location", func(c *service.CreateJobInput) { c.LocationID = "00000000-0000-0000-0000-0000000000ff" }, 404},
+			{"unknown service type", func(c *service.CreateJobInput) { c.ServiceTypeID = "00000000-0000-0000-0000-0000000000ff" }, 404},
+			{"malformed customer", func(c *service.CreateJobInput) { c.CustomerID = "nope" }, 400},
+			{"bad start time", func(c *service.CreateJobInput) { c.StartTime = "25:00" }, 400},
+			{"zero length", func(c *service.CreateJobInput) { c.LengthMinutes = 0 }, 400},
+		}
+		for _, tt := range tests {
+			c := in
+			tt.mutate(&c)
+			if _, err := jobs.CreateJob(ctx, c); appStatus(err) != tt.want {
+				t.Errorf("%s: %v", tt.name, err)
+			}
+		}
+		if after := helpers.Scalar(t, ctx, db, `SELECT count(*) FROM jobs`); after != before {
+			t.Fatalf("rows %d -> %d", before, after)
+		}
+	})
+
+	t.Run("the database itself refuses a customer or location that is in use being deleted", func(t *testing.T) {
+		err := helpers.Tx(ctx, db, func(tx *gorm.DB) error {
+			return tx.Exec(`DELETE FROM customers WHERE id = ?`, r.CustomerID).Error
+		})
+		if err == nil {
+			t.Fatal("deleting a customer that has jobs must be refused")
+		}
+	})
+}
+
 func TestIntegrationCreateJobThroughTheDatabase(t *testing.T) {
 	db, ctx := helpers.NewTestDB(t)
 	jobs := buildJobs(db)
 	repo := repository.NewJobRepository(db)
 	date := civil.New(2026, 10, 2)
+	r := helpers.RefsFor(t, ctx, db)
 
 	t.Run("defaults are normalised and persisted", func(t *testing.T) {
-		job, err := jobs.CreateJob(ctx, service.CreateJobInput{Date: date, Recurrence: &recurrence.Rule{Frequency: "daily"}})
+		job, err := jobs.CreateJob(ctx, service.CreateJobInput{CustomerID: r.CustomerID, LocationID: r.LocationID, ServiceTypeID: r.ServiceTypeID, StartTime: "09:00", LengthMinutes: 60, Date: date, Recurrence: &recurrence.Rule{Frequency: "daily"}})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -263,7 +334,7 @@ func TestIntegrationCreateJobThroughTheDatabase(t *testing.T) {
 
 	t.Run("a date with a clock time and zone is stored as its UTC calendar day", func(t *testing.T) {
 		late := time.Date(2026, 10, 3, 2, 30, 0, 0, time.FixedZone("+7", 7*3600)) // 2026-10-02 19:30 UTC
-		job, err := jobs.CreateJob(ctx, service.CreateJobInput{Date: late})
+		job, err := jobs.CreateJob(ctx, service.CreateJobInput{CustomerID: r.CustomerID, LocationID: r.LocationID, ServiceTypeID: r.ServiceTypeID, StartTime: "09:00", LengthMinutes: 60, Date: late})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -274,25 +345,25 @@ func TestIntegrationCreateJobThroughTheDatabase(t *testing.T) {
 	})
 
 	t.Run("an except job that exists is accepted, one that does not is a 404, a malformed one a 400", func(t *testing.T) {
-		other, _ := jobs.CreateJob(ctx, service.CreateJobInput{Date: date})
+		other, _ := jobs.CreateJob(ctx, service.CreateJobInput{CustomerID: r.CustomerID, LocationID: r.LocationID, ServiceTypeID: r.ServiceTypeID, StartTime: "09:00", LengthMinutes: 60, Date: date})
 		ok := &recurrence.Rule{Frequency: "daily", ExceptType: "frequency", ExceptJobID: other.ID}
-		if _, err := jobs.CreateJob(ctx, service.CreateJobInput{Date: date, Recurrence: ok}); err != nil {
+		if _, err := jobs.CreateJob(ctx, service.CreateJobInput{CustomerID: r.CustomerID, LocationID: r.LocationID, ServiceTypeID: r.ServiceTypeID, StartTime: "09:00", LengthMinutes: 60, Date: date, Recurrence: ok}); err != nil {
 			t.Fatal(err)
 		}
 		missing := &recurrence.Rule{Frequency: "daily", ExceptType: "frequency", ExceptJobID: "00000000-0000-0000-0000-0000000000ff"}
-		if _, err := jobs.CreateJob(ctx, service.CreateJobInput{Date: date, Recurrence: missing}); appStatus(err) != 404 {
+		if _, err := jobs.CreateJob(ctx, service.CreateJobInput{CustomerID: r.CustomerID, LocationID: r.LocationID, ServiceTypeID: r.ServiceTypeID, StartTime: "09:00", LengthMinutes: 60, Date: date, Recurrence: missing}); appStatus(err) != 404 {
 			t.Errorf("missing: %v", err)
 		}
 		bad := &recurrence.Rule{Frequency: "daily", ExceptType: "frequency", ExceptJobID: "nope"}
-		if _, err := jobs.CreateJob(ctx, service.CreateJobInput{Date: date, Recurrence: bad}); appStatus(err) != 400 {
+		if _, err := jobs.CreateJob(ctx, service.CreateJobInput{CustomerID: r.CustomerID, LocationID: r.LocationID, ServiceTypeID: r.ServiceTypeID, StartTime: "09:00", LengthMinutes: 60, Date: date, Recurrence: bad}); appStatus(err) != 400 {
 			t.Errorf("malformed: %v", err)
 		}
 	})
 
 	t.Run("a rejected job leaves nothing behind", func(t *testing.T) {
 		before := helpers.Scalar(t, ctx, db, `SELECT count(*) FROM jobs`)
-		_, err := jobs.CreateJob(ctx, service.CreateJobInput{Date: date, Status: "rescheduled"})
-		_, err2 := jobs.CreateJob(ctx, service.CreateJobInput{Date: date, Recurrence: &recurrence.Rule{Frequency: "weekly"}})
+		_, err := jobs.CreateJob(ctx, service.CreateJobInput{CustomerID: r.CustomerID, LocationID: r.LocationID, ServiceTypeID: r.ServiceTypeID, StartTime: "09:00", LengthMinutes: 60, Date: date, Status: "rescheduled"})
+		_, err2 := jobs.CreateJob(ctx, service.CreateJobInput{CustomerID: r.CustomerID, LocationID: r.LocationID, ServiceTypeID: r.ServiceTypeID, StartTime: "09:00", LengthMinutes: 60, Date: date, Recurrence: &recurrence.Rule{Frequency: "weekly"}})
 		if appStatus(err) != 400 || appStatus(err2) != 400 {
 			t.Fatalf("%v / %v", err, err2)
 		}

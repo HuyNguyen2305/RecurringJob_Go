@@ -21,9 +21,20 @@ func TestOccurrenceRepository(t *testing.T) {
 	job := helpers.SeedJob(t, ctx, db, fixtures.DailyJob(civil.New(2026, 10, 1)))
 	other := helpers.SeedJob(t, ctx, db, fixtures.DailyJob(civil.New(2026, 10, 1)))
 
+	// row builds an occurrence that also satisfies the table's consistency
+	// CHECKs: completed needs completed_at, rescheduled needs rescheduled_to.
 	row := func(jobID, date, status string) *model.JobOccurrence {
 		d, _ := civil.Parse(date)
-		return &model.JobOccurrence{JobID: jobID, OccurrenceDate: d, Status: status}
+		o := &model.JobOccurrence{JobID: jobID, OccurrenceDate: d, Status: status}
+		switch status {
+		case "completed":
+			done := time.Date(2026, 10, 2, 9, 0, 0, 0, time.UTC)
+			o.CompletedAt = &done
+		case "rescheduled":
+			to := civil.AddDays(d, 7)
+			o.RescheduledTo = &to
+		}
+		return o
 	}
 
 	t.Run("Create fills id and timestamps; ListByJob returns rows by date, scoped to the job", func(t *testing.T) {
@@ -130,6 +141,14 @@ func TestOccurrenceRepositoryUpdateGuarded(t *testing.T) {
 	seed := func(status string) *model.JobOccurrence {
 		d = civil.AddDays(d, 1)
 		r := &model.JobOccurrence{JobID: job.ID, OccurrenceDate: d, Status: status}
+		switch status { // the table's consistency CHECKs
+		case "completed":
+			done := time.Date(2026, 10, 2, 9, 0, 0, 0, time.UTC)
+			r.CompletedAt = &done
+		case "rescheduled":
+			to := civil.AddDays(d, 7)
+			r.RescheduledTo = &to
+		}
 		if err := occs.Create(ctx, r); err != nil {
 			t.Fatal(err)
 		}
@@ -213,7 +232,7 @@ func TestOccurrenceRepositoryUpdateGuarded(t *testing.T) {
 	t.Run("two sequential guarded updates: the second sees the first and affects nothing", func(t *testing.T) {
 		r := seed("unconfirmed")
 		allowed := []string{"unconfirmed", "confirmed", "in_progress"}
-		n1, _ := occs.UpdateGuarded(ctx, r.ID, allowed, map[string]any{"status": "completed"})
+		n1, _ := occs.UpdateGuarded(ctx, r.ID, allowed, map[string]any{"status": "completed", "completed_at": time.Now()}) // completed needs completed_at
 		n2, _ := occs.UpdateGuarded(ctx, r.ID, allowed, map[string]any{"status": "canceled"})
 		if n1 != 1 || n2 != 0 || stored(r).Status != "completed" {
 			t.Fatalf("n1=%d n2=%d status=%s", n1, n2, stored(r).Status)

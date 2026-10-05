@@ -3,6 +3,7 @@ package helpers
 import (
 	"context"
 	"encoding/json"
+	"sync"
 	"testing"
 
 	"gorm.io/gorm"
@@ -30,10 +31,73 @@ func MustTx(t *testing.T, ctx context.Context, db *gorm.DB, fn func(tx *gorm.DB)
 	}
 }
 
-// SeedJob inserts job into the tenant schema carried by ctx.
+// Refs are the ids of a customer, one of its locations and a service type.
+type Refs struct {
+	CustomerID    string
+	LocationID    string
+	ServiceTypeID string
+}
+
+var (
+	refsMu    sync.Mutex
+	refsCache = map[string]Refs{}
+)
+
+// SeedRefs inserts a customer ("Ada Lovelace"), a location of that customer
+// and a service type into the tenant schema carried by ctx, and returns their
+// ids. Every call creates a new set.
+func SeedRefs(t *testing.T, ctx context.Context, db *gorm.DB) Refs {
+	t.Helper()
+	email, city := "ada@example.com", "Springfield"
+	customer := &model.Customer{Name: "Ada Lovelace", Email: &email}
+	serviceType := &model.ServiceType{Name: "Window cleaning"}
+	MustTx(t, ctx, db, func(tx *gorm.DB) error {
+		if err := tx.Create(customer).Error; err != nil {
+			return err
+		}
+		if err := tx.Create(serviceType).Error; err != nil {
+			return err
+		}
+		return nil
+	})
+	location := &model.Location{CustomerID: customer.ID, AddressLine1: "1 Main Street", City: &city}
+	MustTx(t, ctx, db, func(tx *gorm.DB) error { return tx.Create(location).Error })
+	return Refs{CustomerID: customer.ID, LocationID: location.ID, ServiceTypeID: serviceType.ID}
+}
+
+// RefsFor returns one shared set of references per tenant schema, creating it
+// on first use, for tests that do not care which customer a job belongs to.
+func RefsFor(t *testing.T, ctx context.Context, db *gorm.DB) Refs {
+	t.Helper()
+	schema := auth.TenantSchemaFromContext(ctx)
+	refsMu.Lock()
+	defer refsMu.Unlock()
+	if r, ok := refsCache[schema]; ok {
+		return r
+	}
+	r := SeedRefs(t, ctx, db)
+	refsCache[schema] = r
+	return r
+}
+
+// SeedJob inserts job into the tenant schema carried by ctx. A job without a
+// customer, location and service type gets the schema's shared set, and a
+// missing start time and length default to 09:00 for 60 minutes.
 func SeedJob(t *testing.T, ctx context.Context, db *gorm.DB, job *model.Job) *model.Job {
 	t.Helper()
-	MustTx(t, ctx, db, func(tx *gorm.DB) error { return tx.Create(job).Error })
+	if job.CustomerID == "" {
+		r := RefsFor(t, ctx, db)
+		job.CustomerID, job.LocationID, job.ServiceTypeID = r.CustomerID, r.LocationID, r.ServiceTypeID
+	}
+	if job.StartTime == "" {
+		job.StartTime = "09:00:00"
+	}
+	if job.LengthMinutes == 0 {
+		job.LengthMinutes = 60
+	}
+	MustTx(t, ctx, db, func(tx *gorm.DB) error {
+		return tx.Omit("Customer", "Location", "ServiceType").Create(job).Error
+	})
 	return job
 }
 

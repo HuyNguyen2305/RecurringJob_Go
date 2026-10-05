@@ -91,7 +91,7 @@ func TestBaseRepositoryTenantIsolation(t *testing.T) {
 	jobs := repository.NewJobRepository(db)
 
 	a := fixtures.OneOffJob(civil.New(2026, 10, 2))
-	if err := jobs.Create(ctxA, a); err != nil {
+	if err := jobs.Create(ctxA, withRefs(t, ctxA, db, a)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := jobs.GetJob(ctxA, a.ID); err != nil {
@@ -121,7 +121,7 @@ func TestBaseRepositoryNestedTransactions(t *testing.T) {
 	t.Run("an inner call joins the outer transaction", func(t *testing.T) {
 		j := fixtures.OneOffJob(civil.New(2026, 10, 2))
 		err := base.Transaction(ctx, func(txCtx context.Context) error {
-			if err := jobs.Create(txCtx, j); err != nil {
+			if err := jobs.Create(txCtx, withRefs(t, ctx, db, j)); err != nil {
 				return err
 			}
 			if _, err := jobs.GetJob(txCtx, j.ID); err != nil {
@@ -141,7 +141,7 @@ func TestBaseRepositoryNestedTransactions(t *testing.T) {
 	t.Run("an inner failure rolls back the outer writes", func(t *testing.T) {
 		before := count()
 		err := base.Transaction(ctx, func(txCtx context.Context) error {
-			if err := jobs.Create(txCtx, fixtures.OneOffJob(civil.New(2026, 10, 3))); err != nil {
+			if err := jobs.Create(txCtx, withRefs(t, ctx, db, fixtures.OneOffJob(civil.New(2026, 10, 3)))); err != nil {
 				return err
 			}
 			return base.Transaction(txCtx, func(context.Context) error { return boom })
@@ -155,7 +155,7 @@ func TestBaseRepositoryNestedTransactions(t *testing.T) {
 		before := count()
 		err := base.Transaction(ctx, func(txCtx context.Context) error {
 			if err := base.Transaction(txCtx, func(inner context.Context) error {
-				return jobs.Create(inner, fixtures.OneOffJob(civil.New(2026, 10, 4)))
+				return jobs.Create(inner, withRefs(t, ctx, db, fixtures.OneOffJob(civil.New(2026, 10, 4))))
 			}); err != nil {
 				return err
 			}
@@ -169,10 +169,10 @@ func TestBaseRepositoryNestedTransactions(t *testing.T) {
 	t.Run("a repository error inside a transaction aborts it", func(t *testing.T) {
 		before := count()
 		err := base.Transaction(ctx, func(txCtx context.Context) error {
-			if err := jobs.Create(txCtx, fixtures.OneOffJob(civil.New(2026, 10, 5))); err != nil {
+			if err := jobs.Create(txCtx, withRefs(t, ctx, db, fixtures.OneOffJob(civil.New(2026, 10, 5)))); err != nil {
 				return err
 			}
-			return jobs.Create(txCtx, &model.Job{Date: civil.New(2026, 10, 6), Status: "rescheduled"}) // CHECK violation
+			return jobs.Create(txCtx, withRefs(t, ctx, db, &model.Job{Date: civil.New(2026, 10, 6), Status: "rescheduled"})) // CHECK violation
 		})
 		if err == nil || count() != before {
 			t.Fatalf("err=%v count %d -> %d", err, before, count())

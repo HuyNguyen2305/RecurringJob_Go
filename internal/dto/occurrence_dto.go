@@ -21,6 +21,9 @@ type OccurrenceResponse struct {
 	RescheduledTo   *string    `json:"rescheduledTo"`
 	RescheduledFrom *string    `json:"rescheduledFrom"`
 	CompletedAt     *time.Time `json:"completedAt"`
+	// PaidInvoiceIDs appears only when a canceled or terminated occurrence has
+	// paid invoices that were kept and need follow-up.
+	PaidInvoiceIDs []string `json:"paidInvoiceIds,omitempty"`
 }
 
 func NewOccurrenceResponse(o *model.JobOccurrence) OccurrenceResponse {
@@ -36,6 +39,7 @@ func NewOccurrenceResponse(o *model.JobOccurrence) OccurrenceResponse {
 		RescheduledTo:   fmtDate(o.RescheduledTo),
 		RescheduledFrom: fmtDate(o.RescheduledFrom),
 		CompletedAt:     completed,
+		PaidInvoiceIDs:  o.PaidInvoiceIDs,
 	}
 }
 

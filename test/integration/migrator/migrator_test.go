@@ -13,6 +13,9 @@ import (
 	"recurringjob/test/helpers"
 )
 
+// realMigrations are the files in the repository's migrations folder, in order.
+var realMigrations = []string{"0001_reference_data.sql", "0002_jobs_and_occurrences.sql", "0003_customer_documents.sql"}
+
 func TestMain(m *testing.M) {
 	helpers.ApplyLocalTZ()
 	os.Exit(m.Run())
@@ -73,11 +76,11 @@ func TestApplyRealMigrations(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(res.Applied, []string{"0001_jobs_and_occurrences.sql"}) || len(res.Skipped) != 0 {
+	if !reflect.DeepEqual(res.Applied, realMigrations) || len(res.Skipped) != 0 {
 		t.Fatalf("result %+v", res)
 	}
-	if n := tableCount(t, db, schema, "jobs", "job_occurrences", "schema_migrations"); n != 3 {
-		t.Fatalf("%d of the 3 tables exist", n)
+	if n := tableCount(t, db, schema, "customers", "locations", "service_types", "jobs", "job_occurrences", "customer_documents", "customer_line_items", "schema_migrations"); n != 8 {
+		t.Fatalf("%d of the 8 tables exist", n)
 	}
 
 	t.Run("the schema has the constraints the business rules rely on", func(t *testing.T) {
@@ -101,16 +104,42 @@ func TestApplyRealMigrations(t *testing.T) {
 		if count("c") < 2 {
 			t.Error("missing the status CHECK constraints")
 		}
-		var onDelete string
-		db.Raw(`SELECT rc.delete_rule FROM information_schema.referential_constraints rc WHERE rc.constraint_schema = ?`, schema).Scan(&onDelete)
-		if onDelete != "CASCADE" {
-			t.Errorf("delete rule %q, want CASCADE", onDelete)
+		deleteRule := func(table string) string {
+			var rule string
+			db.Raw(`SELECT rc.delete_rule FROM information_schema.referential_constraints rc
+				JOIN information_schema.table_constraints tc ON tc.constraint_schema = rc.constraint_schema AND tc.constraint_name = rc.constraint_name
+				WHERE rc.constraint_schema = ? AND tc.table_name = ?`, schema, table).Scan(&rule)
+			return rule
+		}
+		if got := deleteRule("job_occurrences"); got != "CASCADE" {
+			t.Errorf("job_occurrences delete rule %q, want CASCADE", got)
+		}
+		if got := deleteRule("customer_line_items"); got != "CASCADE" {
+			t.Errorf("customer_line_items delete rule %q, want CASCADE", got)
+		}
+		if got := deleteRule("customer_documents"); got == "CASCADE" {
+			t.Error("deleting a job must not silently delete its estimates and invoices")
+		}
+		// A customer, location or service type that is in use cannot be deleted.
+		for table, want := range map[string]int{"locations": 1, "jobs": 3, "customer_documents": 4} {
+			var rules []string
+			db.Raw(`SELECT rc.delete_rule FROM information_schema.referential_constraints rc
+				JOIN information_schema.table_constraints tc ON tc.constraint_schema = rc.constraint_schema AND tc.constraint_name = rc.constraint_name
+				WHERE rc.constraint_schema = ? AND tc.table_name = ?`, schema, table).Scan(&rules)
+			if len(rules) != want {
+				t.Errorf("%s has %d foreign keys, want %d", table, len(rules), want)
+			}
+			for _, r := range rules {
+				if r != "RESTRICT" {
+					t.Errorf("%s has a foreign key with delete rule %s, want RESTRICT", table, r)
+				}
+			}
 		}
 	})
 
 	t.Run("running it again skips everything and changes nothing", func(t *testing.T) {
 		res, err := migrator.Apply(db, schema, helpers.MigrationsDir())
-		if err != nil || len(res.Applied) != 0 || !reflect.DeepEqual(res.Skipped, []string{"0001_jobs_and_occurrences.sql"}) {
+		if err != nil || len(res.Applied) != 0 || !reflect.DeepEqual(res.Skipped, realMigrations) {
 			t.Fatalf("res=%+v err=%v", res, err)
 		}
 	})
@@ -185,7 +214,7 @@ func TestApplyEdgeCases(t *testing.T) {
 	t.Run("two schemas migrate independently", func(t *testing.T) {
 		a, b := newName(t, db), newName(t, db)
 		for _, s := range []string{a, b} {
-			if res, err := migrator.Apply(db, s, helpers.MigrationsDir()); err != nil || len(res.Applied) != 1 {
+			if res, err := migrator.Apply(db, s, helpers.MigrationsDir()); err != nil || len(res.Applied) != len(realMigrations) {
 				t.Fatalf("%s: res=%+v err=%v", s, res, err)
 			}
 		}

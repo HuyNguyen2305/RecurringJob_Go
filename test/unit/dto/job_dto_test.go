@@ -2,6 +2,7 @@ package dto_test
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -10,6 +11,22 @@ import (
 	"recurringjob/internal/model"
 	"recurringjob/internal/recurrence"
 )
+
+func TestNewJobResponseCarriesCustomerLocationServiceAndTime(t *testing.T) {
+	got := dto.NewJobResponse(&model.Job{
+		ID: "j1", CustomerID: "c1", LocationID: "l1", ServiceTypeID: "s1",
+		Date: civil.New(2026, 10, 2), StartTime: "09:30:00", LengthMinutes: 90, Status: "unconfirmed",
+	})
+	if got.CustomerID != "c1" || got.LocationID != "l1" || got.ServiceTypeID != "s1" || got.StartTime != "09:30:00" || got.LengthMinutes != 90 {
+		t.Fatalf("got %+v", got)
+	}
+	raw, _ := json.Marshal(got)
+	for _, key := range []string{`"customerId":"c1"`, `"locationId":"l1"`, `"serviceTypeId":"s1"`, `"startTime":"09:30:00"`, `"lengthMinutes":90`} {
+		if !strings.Contains(string(raw), key) {
+			t.Errorf("json %s lacks %s", raw, key)
+		}
+	}
+}
 
 func TestNewJobResponse(t *testing.T) {
 	t.Run("one-off job", func(t *testing.T) {

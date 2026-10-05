@@ -48,7 +48,9 @@ func (h *JobHandler) Create(c *gin.Context) {
 		return
 	}
 	job, err := h.jobs.CreateJob(c.Request.Context(), service.CreateJobInput{
-		Date: date, Status: req.Status, Recurrence: req.Recurrence,
+		CustomerID: req.CustomerID, LocationID: req.LocationID, ServiceTypeID: req.ServiceTypeID,
+		Date: date, StartTime: req.StartTime, LengthMinutes: req.LengthMinutes,
+		Status: req.Status, Recurrence: req.Recurrence,
 	})
 	if err != nil {
 		fail(c, err)

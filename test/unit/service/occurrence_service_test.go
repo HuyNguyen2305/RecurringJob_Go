@@ -1061,3 +1061,99 @@ func TestCompletedAtIsStoredAtMicrosecondPrecision(t *testing.T) {
 		t.Errorf("stored completedAt = %v, want %s", row, want)
 	}
 }
+
+// fakeVoider records what the occurrence service asks of the invoice side.
+type fakeVoider struct {
+	voided  []voidCall
+	paid    []string
+	voidErr error
+	paidErr error
+}
+
+func (f *fakeVoider) VoidUnpaidForOccurrence(_ context.Context, jobID string, date time.Time) (int64, error) {
+	f.voided = append(f.voided, voidCall{jobID: jobID, date: date})
+	return 1, f.voidErr
+}
+
+func (f *fakeVoider) PaidIDsForOccurrence(context.Context, string, time.Time) ([]string, error) {
+	return f.paid, f.paidErr
+}
+
+func TestCancelingOrTerminatingAnOccurrenceVoidsItsInvoices(t *testing.T) {
+	ctx := context.Background()
+	jobID := uid("b1")
+	newJob := func() mockJobs {
+		job := recJob(jobID, "2026-10-02", recurrence.Rule{Frequency: "weekly", WeeklyPeriod: "every", WeeklyDaysOfWeek: []int{5}})
+		job.Status = service.StatusUnconfirmed
+		return mockJobs{jobID: job}
+	}
+
+	for _, status := range []string{service.StatusCanceled, service.StatusTerminateService} {
+		t.Run(status+" voids the unpaid invoices of that occurrence", func(t *testing.T) {
+			s, repo := newService(newJob())
+			voider := &fakeVoider{}
+			s.WithInvoices(voider)
+			saved, err := s.UpdateOccurrence(ctx, jobID, dt("2026-10-02"), upd(status))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(voider.voided) != 1 || voider.voided[0].jobID != jobID || !voider.voided[0].date.Equal(dt("2026-10-02")) {
+				t.Fatalf("void calls %+v", voider.voided)
+			}
+			if len(saved.PaidInvoiceIDs) != 0 || repo.byDate("2026-10-02") == nil || repo.byDate("2026-10-02").Status != status {
+				t.Fatalf("saved %+v", saved)
+			}
+		})
+
+		t.Run(status+" reports the paid invoices it kept", func(t *testing.T) {
+			s, _ := newService(newJob())
+			s.WithInvoices(&fakeVoider{paid: []string{"inv-1", "inv-2"}})
+			saved, err := s.UpdateOccurrence(ctx, jobID, dt("2026-10-02"), upd(status))
+			if err != nil || !reflect.DeepEqual(saved.PaidInvoiceIDs, []string{"inv-1", "inv-2"}) {
+				t.Fatalf("saved %+v err=%v", saved, err)
+			}
+		})
+	}
+
+	t.Run("other status changes leave invoices alone", func(t *testing.T) {
+		for _, status := range []string{service.StatusConfirmed, service.StatusInProgress, service.StatusCompleted} {
+			s, _ := newService(newJob())
+			voider := &fakeVoider{paid: []string{"inv-1"}}
+			s.WithInvoices(voider)
+			saved, err := s.UpdateOccurrence(ctx, jobID, dt("2026-10-02"), upd(status))
+			if err != nil || len(voider.voided) != 0 || len(saved.PaidInvoiceIDs) != 0 {
+				t.Errorf("%s: err=%v voided=%v saved=%+v", status, err, voider.voided, saved)
+			}
+		}
+	})
+
+	t.Run("rescheduling leaves invoices alone", func(t *testing.T) {
+		s, _ := newService(newJob())
+		voider := &fakeVoider{}
+		s.WithInvoices(voider)
+		to := dt("2026-10-03")
+		if _, err := s.UpdateOccurrence(ctx, jobID, dt("2026-10-02"), service.UpdateOccurrenceRequest{Status: service.StatusRescheduled, RescheduledTo: &to}); err != nil {
+			t.Fatal(err)
+		}
+		if len(voider.voided) != 0 {
+			t.Fatalf("void calls %+v", voider.voided)
+		}
+	})
+
+	t.Run("a failure while voiding rolls the status change back", func(t *testing.T) {
+		boom := errors.New("db down")
+		for name, voider := range map[string]*fakeVoider{
+			"void fails":   {voidErr: boom},
+			"lookup fails": {paidErr: boom},
+		} {
+			s, repo := newService(newJob())
+			s.WithInvoices(voider)
+			if _, err := s.UpdateOccurrence(ctx, jobID, dt("2026-10-02"), upd(service.StatusCanceled)); !errors.Is(err, boom) {
+				t.Errorf("%s: %v", name, err)
+			}
+			if repo.byDate("2026-10-02") != nil {
+				t.Errorf("%s: the occurrence stayed canceled although its invoices were not handled", name)
+			}
+		}
+	})
+}

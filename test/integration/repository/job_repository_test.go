@@ -1,6 +1,7 @@
 package repository_test
 
 import (
+	"context"
 	"errors"
 	"reflect"
 	"regexp"
@@ -8,6 +9,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
+	"gorm.io/gorm"
 
 	"recurringjob/internal/common/apperror"
 	"recurringjob/internal/common/civil"
@@ -34,7 +36,7 @@ func TestJobRepositoryCreateAndGet(t *testing.T) {
 
 	t.Run("a one-off job round-trips, with a generated id and default status", func(t *testing.T) {
 		in := &model.Job{Date: civil.New(2026, 10, 2)} // no status: the database default applies
-		if err := jobs.Create(ctx, in); err != nil {
+		if err := jobs.Create(ctx, withRefs(t, ctx, db, in)); err != nil {
 			t.Fatal(err)
 		}
 		if !uuidRe.MatchString(in.ID) || in.CreatedAt.IsZero() || in.UpdatedAt.IsZero() {
@@ -51,7 +53,7 @@ func TestJobRepositoryCreateAndGet(t *testing.T) {
 
 	t.Run("a nil recurrence is stored as SQL NULL, not the JSON text null", func(t *testing.T) {
 		j := fixtures.OneOffJob(civil.New(2026, 10, 2))
-		if err := jobs.Create(ctx, j); err != nil {
+		if err := jobs.Create(ctx, withRefs(t, ctx, db, j)); err != nil {
 			t.Fatal(err)
 		}
 		if n := helpers.Scalar(t, ctx, db, `SELECT count(*) FROM jobs WHERE id = ? AND recurrence IS NULL`, j.ID); n != 1 {
@@ -70,7 +72,7 @@ func TestJobRepositoryCreateAndGet(t *testing.T) {
 			ExceptJobID: "4aa72fb5-dbfd-41f1-91d9-7b2e6fabf0c2",
 		}
 		in := &model.Job{Date: civil.New(2026, 10, 2), Status: "confirmed", Recurrence: &rule}
-		if err := jobs.Create(ctx, in); err != nil {
+		if err := jobs.Create(ctx, withRefs(t, ctx, db, in)); err != nil {
 			t.Fatal(err)
 		}
 		got, err := jobs.GetJob(ctx, in.ID)
@@ -90,7 +92,7 @@ func TestJobRepositoryCreateAndGet(t *testing.T) {
 
 	t.Run("a minimal rule keeps only its set fields", func(t *testing.T) {
 		in := fixtures.DailyJob(civil.New(2026, 10, 2))
-		if err := jobs.Create(ctx, in); err != nil {
+		if err := jobs.Create(ctx, withRefs(t, ctx, db, in)); err != nil {
 			t.Fatal(err)
 		}
 		got, err := jobs.GetJob(ctx, in.ID)
@@ -103,7 +105,7 @@ func TestJobRepositoryCreateAndGet(t *testing.T) {
 		for _, s := range []string{"0001-01-01", "1999-12-31", "2000-02-29", "9999-12-31"} {
 			d, _ := civil.Parse(s)
 			in := &model.Job{Date: d}
-			if err := jobs.Create(ctx, in); err != nil {
+			if err := jobs.Create(ctx, withRefs(t, ctx, db, in)); err != nil {
 				t.Fatalf("%s: %v", s, err)
 			}
 			got, err := jobs.GetJob(ctx, in.ID)
@@ -139,13 +141,112 @@ func TestJobRepositoryErrors(t *testing.T) {
 
 	t.Run("the database refuses statuses a job may not have", func(t *testing.T) {
 		for _, bad := range []string{"rescheduled", "bogus", "Confirmed"} {
-			err := jobs.Create(ctx, &model.Job{Date: civil.New(2026, 10, 2), Status: bad})
+			err := jobs.Create(ctx, withRefs(t, ctx, db, &model.Job{Date: civil.New(2026, 10, 2), Status: bad}))
 			if code := pgCode(err); code != "23514" {
 				t.Errorf("%q: pg code %q (err=%v), want 23514 check_violation", bad, code, err)
 			}
 		}
 		if n := helpers.Scalar(t, ctx, db, `SELECT count(*) FROM jobs`); n != 0 {
 			t.Fatalf("%d rows were stored", n)
+		}
+	})
+}
+
+// withRefs gives a job the schema's shared customer, location and service
+// type and a default time and length, unless it already has them.
+func withRefs(t *testing.T, ctx context.Context, db *gorm.DB, j *model.Job) *model.Job {
+	t.Helper()
+	if j.CustomerID == "" {
+		r := helpers.RefsFor(t, ctx, db)
+		j.CustomerID, j.LocationID, j.ServiceTypeID = r.CustomerID, r.LocationID, r.ServiceTypeID
+	}
+	if j.StartTime == "" {
+		j.StartTime = "09:00:00"
+	}
+	if j.LengthMinutes == 0 {
+		j.LengthMinutes = 60
+	}
+	return j
+}
+
+func TestJobRepositoryReferences(t *testing.T) {
+	db, ctx := helpers.NewTestDB(t)
+	jobs := repository.NewJobRepository(db)
+	r := helpers.RefsFor(t, ctx, db)
+	other := helpers.SeedRefs(t, ctx, db)
+
+	t.Run("a job loads with its customer, location and service type", func(t *testing.T) {
+		in := withRefs(t, ctx, db, &model.Job{Date: civil.New(2026, 10, 2), StartTime: "13:45:00", LengthMinutes: 120})
+		if err := jobs.Create(ctx, in); err != nil {
+			t.Fatal(err)
+		}
+		got, err := jobs.GetJob(ctx, in.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.StartTime != "13:45:00" || got.LengthMinutes != 120 || got.CustomerID != r.CustomerID {
+			t.Fatalf("got %+v", got)
+		}
+		if got.Customer == nil || got.Customer.Name != "Ada Lovelace" || got.Customer.Email == nil || *got.Customer.Email != "ada@example.com" || got.Customer.Phone != nil {
+			t.Fatalf("customer %+v", got.Customer)
+		}
+		if got.Location == nil || got.Location.AddressLine1 != "1 Main Street" || got.Location.CustomerID != r.CustomerID || got.Location.State != nil {
+			t.Fatalf("location %+v", got.Location)
+		}
+		if got.ServiceType == nil || got.ServiceType.Name != "Window cleaning" || got.ServiceType.Description != nil {
+			t.Fatalf("service type %+v", got.ServiceType)
+		}
+	})
+
+	t.Run("saving a job never writes through its loaded customer, location or service type", func(t *testing.T) {
+		in := withRefs(t, ctx, db, &model.Job{Date: civil.New(2026, 10, 3)})
+		in.Customer = &model.Customer{ID: other.CustomerID, Name: "Changed In Memory"}
+		in.Location = &model.Location{ID: other.LocationID, CustomerID: other.CustomerID, AddressLine1: "Changed"}
+		in.ServiceType = &model.ServiceType{ID: other.ServiceTypeID, Name: "Changed"}
+		if err := jobs.Create(ctx, in); err != nil {
+			t.Fatal(err)
+		}
+		if n := helpers.Scalar(t, ctx, db, `SELECT count(*) FROM customers WHERE name = 'Changed In Memory'`); n != 0 {
+			t.Fatal("the customer was overwritten through the job")
+		}
+		if n := helpers.Scalar(t, ctx, db, `SELECT count(*) FROM service_types WHERE name = 'Changed'`); n != 0 {
+			t.Fatal("the service type was overwritten through the job")
+		}
+		got, _ := jobs.GetJob(ctx, in.ID)
+		if got.CustomerID != r.CustomerID || got.Customer.Name != "Ada Lovelace" {
+			t.Fatalf("the job's own ids decide: %+v", got)
+		}
+	})
+
+	t.Run("the database enforces references and the length range", func(t *testing.T) {
+		const none = "00000000-0000-0000-0000-0000000000ff"
+		tests := []struct {
+			name   string
+			mutate func(j *model.Job)
+			code   string
+		}{
+			{"unknown customer", func(j *model.Job) { j.CustomerID = none }, "23503"},
+			{"unknown location", func(j *model.Job) { j.LocationID = none }, "23503"},
+			{"unknown service type", func(j *model.Job) { j.ServiceTypeID = none }, "23503"},
+			{"zero length", func(j *model.Job) { j.LengthMinutes = -1 }, "23514"},
+			{"longer than a day", func(j *model.Job) { j.LengthMinutes = 1441 }, "23514"},
+		}
+		for _, tt := range tests {
+			j := withRefs(t, ctx, db, &model.Job{Date: civil.New(2026, 10, 4)})
+			tt.mutate(j)
+			if code := pgCode(jobs.Create(ctx, j)); code != tt.code {
+				t.Errorf("%s: pg code %q, want %s", tt.name, code, tt.code)
+			}
+		}
+	})
+
+	t.Run("a customer or location with jobs cannot be deleted", func(t *testing.T) {
+		for _, q := range []string{`DELETE FROM customers WHERE id = ?`, `DELETE FROM locations WHERE id = ?`, `DELETE FROM service_types WHERE id = ?`} {
+			id := map[string]string{"customers": r.CustomerID, "locations": r.LocationID, "service_types": r.ServiceTypeID}[q[len("DELETE FROM "):len(q)-len(" WHERE id = ?")]]
+			err := helpers.Tx(ctx, db, func(tx *gorm.DB) error { return tx.Exec(q, id).Error })
+			if code := pgCode(err); code != "23001" {
+				t.Errorf("%s: pg code %q (err=%v), want 23001 restrict_violation", q, code, err)
+			}
 		}
 	})
 }

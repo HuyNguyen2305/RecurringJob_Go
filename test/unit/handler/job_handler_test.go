@@ -67,11 +67,50 @@ func decode(t *testing.T, w *httptest.ResponseRecorder) map[string]any {
 	return m
 }
 
+func TestJobHandlerCreateCustomerLocationServiceAndTime(t *testing.T) {
+	t.Run("the references, start time and length reach the service", func(t *testing.T) {
+		f := &fakeJobs{}
+		r := newEngine(func(r *gin.Engine) { r.POST("/jobs", handler.NewJobHandler(f).Create) })
+		w := do(r, "POST", "/jobs", `{`+refsJSON+`,"date":"2026-10-02","startTime":"09:30","lengthMinutes":90}`)
+		if w.Code != 200 {
+			t.Fatalf("status %d: %s", w.Code, w.Body)
+		}
+		in := f.createIn
+		if in.CustomerID != cust || in.LocationID != loc || in.ServiceTypeID != svc || in.StartTime != "09:30" || in.LengthMinutes != 90 {
+			t.Fatalf("input %+v", in)
+		}
+	})
+
+	t.Run("each of them is required", func(t *testing.T) {
+		full := map[string]string{
+			"customerId": `"` + cust + `"`, "locationId": `"` + loc + `"`, "serviceTypeId": `"` + svc + `"`,
+			"date": `"2026-10-02"`, "startTime": `"09:00"`, "lengthMinutes": `60`,
+		}
+		for missing := range full {
+			body := "{"
+			for k, v := range full {
+				if k != missing {
+					if len(body) > 1 {
+						body += ","
+					}
+					body += `"` + k + `":` + v
+				}
+			}
+			body += "}"
+			f := &fakeJobs{}
+			r := newEngine(func(r *gin.Engine) { r.POST("/jobs", handler.NewJobHandler(f).Create) })
+			if w := do(r, "POST", "/jobs", body); w.Code != 400 || !f.createIn.Date.IsZero() {
+				t.Errorf("without %s: status %d (service called=%v)", missing, w.Code, !f.createIn.Date.IsZero())
+			}
+		}
+	})
+}
+
 func TestJobHandlerCreate(t *testing.T) {
 	t.Run("success envelope with recurrence passed through", func(t *testing.T) {
 		f := &fakeJobs{}
 		r := newEngine(func(r *gin.Engine) { r.POST("/jobs", handler.NewJobHandler(f).Create) })
-		w := do(r, "POST", "/jobs", `{"date":"2026-10-02","recurrence":{"frequency":"weekly","weeklyPeriod":"every","weeklyDaysOfWeek":[1,3]}}`)
+		w := do(r, "POST", "/jobs", `{`+jobRefs+`,"date":"2026-10-02","recurrence":{"frequency":"weekly","weeklyPeriod":"every","weeklyDaysOfWeek":[1,3]}}`)
 		if w.Code != 200 {
 			t.Fatalf("status %d: %s", w.Code, w.Body)
 		}
@@ -91,7 +130,7 @@ func TestJobHandlerCreate(t *testing.T) {
 	t.Run("bad requests are 400 and never reach the service", func(t *testing.T) {
 		for name, body := range map[string]string{
 			"missing date": `{}`,
-			"bad date":     `{"date":"10/02/2026"}`,
+			"bad date":     `{` + jobRefs + `,"date":"10/02/2026"}`,
 			"bad json":     `{`,
 		} {
 			f := &fakeJobs{}
@@ -110,7 +149,7 @@ func TestJobHandlerCreate(t *testing.T) {
 		for status, err := range map[int]error{400: apperror.Validation("v"), 404: apperror.NotFound("n"), 500: context.DeadlineExceeded} {
 			f := &fakeJobs{createErr: err}
 			r := newEngine(func(r *gin.Engine) { r.POST("/jobs", handler.NewJobHandler(f).Create) })
-			if w := do(r, "POST", "/jobs", `{"date":"2026-10-02"}`); w.Code != status {
+			if w := do(r, "POST", "/jobs", `{`+jobRefs+`,"date":"2026-10-02"}`); w.Code != status {
 				t.Errorf("want %d, got %d", status, w.Code)
 			}
 		}
@@ -205,15 +244,15 @@ func TestJobHandlerCreateBodies(t *testing.T) {
 			"empty body":                   ``,
 			"null":                         `null`,
 			"array":                        `[]`,
-			"number date":                  `{"date":20261002}`,
-			"empty date":                   `{"date":""}`,
-			"date with whitespace":         `{"date":" 2026-10-02"}`,
-			"impossible date":              `{"date":"2026-02-30"}`,
-			"date with time":               `{"date":"2026-10-02T00:00:00Z"}`,
-			"status of the wrong type":     `{"date":"2026-10-02","status":5}`,
-			"recurrence of the wrong type": `{"date":"2026-10-02","recurrence":"daily"}`,
-			"weekday list of strings":      `{"date":"2026-10-02","recurrence":{"frequency":"weekly","weeklyDaysOfWeek":["mon"]}}`,
-			"interval of the wrong type":   `{"date":"2026-10-02","recurrence":{"frequency":"daily","interval":"2"}}`,
+			"number date":                  `{` + jobRefs + `,"date":20261002}`,
+			"empty date":                   `{` + jobRefs + `,"date":""}`,
+			"date with whitespace":         `{` + jobRefs + `,"date":" 2026-10-02"}`,
+			"impossible date":              `{` + jobRefs + `,"date":"2026-02-30"}`,
+			"date with time":               `{` + jobRefs + `,"date":"2026-10-02T00:00:00Z"}`,
+			"status of the wrong type":     `{` + jobRefs + `,"date":"2026-10-02","status":5}`,
+			"recurrence of the wrong type": `{` + jobRefs + `,"date":"2026-10-02","recurrence":"daily"}`,
+			"weekday list of strings":      `{` + jobRefs + `,"date":"2026-10-02","recurrence":{"frequency":"weekly","weeklyDaysOfWeek":["mon"]}}`,
+			"interval of the wrong type":   `{` + jobRefs + `,"date":"2026-10-02","recurrence":{"frequency":"daily","interval":"2"}}`,
 		} {
 			f := &fakeJobs{}
 			w := serve(f, httptest.NewRequest("POST", "/jobs", strings.NewReader(body)))
@@ -225,7 +264,7 @@ func TestJobHandlerCreateBodies(t *testing.T) {
 
 	t.Run("works without a Content-Type header", func(t *testing.T) {
 		f := &fakeJobs{}
-		w := serve(f, httptest.NewRequest("POST", "/jobs", strings.NewReader(`{"date":"2026-10-02"}`)))
+		w := serve(f, httptest.NewRequest("POST", "/jobs", strings.NewReader(`{`+jobRefs+`,"date":"2026-10-02"}`)))
 		if w.Code != 200 {
 			t.Fatalf("status %d: %s", w.Code, w.Body)
 		}
@@ -233,7 +272,7 @@ func TestJobHandlerCreateBodies(t *testing.T) {
 
 	t.Run("unknown JSON fields are ignored and status is passed through", func(t *testing.T) {
 		f := &fakeJobs{}
-		w := serve(f, httptest.NewRequest("POST", "/jobs", strings.NewReader(`{"date":"2026-10-02","status":"confirmed","extra":{"a":1}}`)))
+		w := serve(f, httptest.NewRequest("POST", "/jobs", strings.NewReader(`{`+jobRefs+`,"date":"2026-10-02","status":"confirmed","extra":{"a":1}}`)))
 		if w.Code != 200 || f.createIn.Status != "confirmed" {
 			t.Fatalf("status %d createIn %+v", w.Code, f.createIn)
 		}
@@ -241,7 +280,7 @@ func TestJobHandlerCreateBodies(t *testing.T) {
 
 	t.Run("a one-off job passes a nil recurrence", func(t *testing.T) {
 		f := &fakeJobs{}
-		serve(f, httptest.NewRequest("POST", "/jobs", strings.NewReader(`{"date":"2026-10-02","recurrence":null}`)))
+		serve(f, httptest.NewRequest("POST", "/jobs", strings.NewReader(`{`+jobRefs+`,"date":"2026-10-02","recurrence":null}`)))
 		if f.createIn.Recurrence != nil {
 			t.Fatalf("recurrence %+v", f.createIn.Recurrence)
 		}
@@ -257,7 +296,7 @@ func TestJobHandlerDoesNotLeakInternalErrors(t *testing.T) {
 		r.GET("/jobs/:id/occurrences", h.Occurrences)
 	})
 	for _, w := range []*httptest.ResponseRecorder{
-		do(r, "POST", "/jobs", `{"date":"2026-10-02"}`),
+		do(r, "POST", "/jobs", `{`+jobRefs+`,"date":"2026-10-02"}`),
 		do(r, "GET", "/jobs/abc/occurrences", ""),
 	} {
 		body := w.Body.String()
