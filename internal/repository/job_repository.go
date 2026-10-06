@@ -5,6 +5,7 @@ import (
 	"errors"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 
 	"recurringjob/internal/common/apperror"
 	"recurringjob/internal/model"
@@ -33,6 +34,33 @@ func (r *JobRepository) GetJob(ctx context.Context, id string) (*model.Job, erro
 		return nil, err
 	}
 	return &job, nil
+}
+
+// LockJob locks the job row until the surrounding transaction ends, so
+// anything that needs the job (an invoice or an occurrence row pointing at
+// it) waits. It is a NotFound when the job does not exist. Call it inside
+// Transaction.
+func (r *JobRepository) LockJob(ctx context.Context, id string) error {
+	return r.WithSchema(ctx, func(tx *gorm.DB) error {
+		var locked model.Job
+		err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Select("id").Where("id = ?", id).First(&locked).Error
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return apperror.NotFound("job not found")
+		}
+		return err
+	})
+}
+
+// Delete removes the job. It is a 409 while a document or an
+// invoice still points at it.
+func (r *JobRepository) Delete(ctx context.Context, id string) error {
+	return r.WithSchema(ctx, func(tx *gorm.DB) error {
+		err := tx.Where("id = ?", id).Delete(&model.Job{}).Error
+		if isForeignKeyViolationOn(err, "job_id") {
+			return apperror.Conflict("the job is still in use")
+		}
+		return err
+	})
 }
 
 // Create saves the job. Its customer, location and service type are read-only

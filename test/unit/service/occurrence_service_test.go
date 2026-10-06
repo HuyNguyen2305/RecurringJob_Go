@@ -17,7 +17,9 @@ import (
 type memOccRepo struct {
 	rows      map[string]*model.JobOccurrence
 	seq       int
-	afterList func() // runs after ListByJob, to simulate a concurrent writer
+	afterList func()   // runs after ListByJob, to simulate a concurrent writer
+	log       []string // Create / UpdateGuarded / LockOccurrence calls, in order
+	lockErr   error
 }
 
 func newMemOccRepo() *memOccRepo { return &memOccRepo{rows: map[string]*model.JobOccurrence{}} }
@@ -38,6 +40,7 @@ func (m *memOccRepo) ListByJob(_ context.Context, jobID string) ([]model.JobOccu
 }
 
 func (m *memOccRepo) Create(_ context.Context, occ *model.JobOccurrence) error {
+	m.log = append(m.log, "create")
 	for _, r := range m.rows {
 		if r.JobID == occ.JobID && r.OccurrenceDate.Equal(occ.OccurrenceDate) {
 			return apperror.Conflict("occurrence was changed by another request")
@@ -51,6 +54,7 @@ func (m *memOccRepo) Create(_ context.Context, occ *model.JobOccurrence) error {
 }
 
 func (m *memOccRepo) UpdateGuarded(_ context.Context, id string, allowedFrom []string, updates map[string]any) (int64, error) {
+	m.log = append(m.log, "update")
 	r, ok := m.rows[id]
 	if !ok || !contains(allowedFrom, r.Status) {
 		return 0, nil
@@ -1062,20 +1066,27 @@ func TestCompletedAtIsStoredAtMicrosecondPrecision(t *testing.T) {
 	}
 }
 
-// fakeVoider records what the occurrence service asks of the invoice side.
-type fakeVoider struct {
+// fakeInvoices records what the occurrence service asks of the invoice side.
+type fakeInvoices struct {
 	voided  []voidCall
+	moved   []moveCall
 	paid    []string
 	voidErr error
+	moveErr error
 	paidErr error
 }
 
-func (f *fakeVoider) VoidUnpaidForOccurrence(_ context.Context, jobID string, date time.Time) (int64, error) {
+func (f *fakeInvoices) MoveUnpaidForOccurrence(_ context.Context, jobID string, from, to time.Time) (int64, error) {
+	f.moved = append(f.moved, moveCall{jobID, from, to})
+	return 1, f.moveErr
+}
+
+func (f *fakeInvoices) VoidUnpaidForOccurrence(_ context.Context, jobID string, date time.Time) (int64, error) {
 	f.voided = append(f.voided, voidCall{jobID: jobID, date: date})
 	return 1, f.voidErr
 }
 
-func (f *fakeVoider) PaidIDsForOccurrence(context.Context, string, time.Time) ([]string, error) {
+func (f *fakeInvoices) PaidIDsForOccurrence(context.Context, string, time.Time) ([]string, error) {
 	return f.paid, f.paidErr
 }
 
@@ -1091,7 +1102,7 @@ func TestCancelingOrTerminatingAnOccurrenceVoidsItsInvoices(t *testing.T) {
 	for _, status := range []string{service.StatusCanceled, service.StatusTerminateService} {
 		t.Run(status+" voids the unpaid invoices of that occurrence", func(t *testing.T) {
 			s, repo := newService(newJob())
-			voider := &fakeVoider{}
+			voider := &fakeInvoices{}
 			s.WithInvoices(voider)
 			saved, err := s.UpdateOccurrence(ctx, jobID, dt("2026-10-02"), upd(status))
 			if err != nil {
@@ -1107,7 +1118,7 @@ func TestCancelingOrTerminatingAnOccurrenceVoidsItsInvoices(t *testing.T) {
 
 		t.Run(status+" reports the paid invoices it kept", func(t *testing.T) {
 			s, _ := newService(newJob())
-			s.WithInvoices(&fakeVoider{paid: []string{"inv-1", "inv-2"}})
+			s.WithInvoices(&fakeInvoices{paid: []string{"inv-1", "inv-2"}})
 			saved, err := s.UpdateOccurrence(ctx, jobID, dt("2026-10-02"), upd(status))
 			if err != nil || !reflect.DeepEqual(saved.PaidInvoiceIDs, []string{"inv-1", "inv-2"}) {
 				t.Fatalf("saved %+v err=%v", saved, err)
@@ -1118,7 +1129,7 @@ func TestCancelingOrTerminatingAnOccurrenceVoidsItsInvoices(t *testing.T) {
 	t.Run("other status changes leave invoices alone", func(t *testing.T) {
 		for _, status := range []string{service.StatusConfirmed, service.StatusInProgress, service.StatusCompleted} {
 			s, _ := newService(newJob())
-			voider := &fakeVoider{paid: []string{"inv-1"}}
+			voider := &fakeInvoices{paid: []string{"inv-1"}}
 			s.WithInvoices(voider)
 			saved, err := s.UpdateOccurrence(ctx, jobID, dt("2026-10-02"), upd(status))
 			if err != nil || len(voider.voided) != 0 || len(saved.PaidInvoiceIDs) != 0 {
@@ -1127,22 +1138,47 @@ func TestCancelingOrTerminatingAnOccurrenceVoidsItsInvoices(t *testing.T) {
 		}
 	})
 
-	t.Run("rescheduling leaves invoices alone", func(t *testing.T) {
-		s, _ := newService(newJob())
-		voider := &fakeVoider{}
-		s.WithInvoices(voider)
+	t.Run("rescheduling moves the unpaid invoices and reports the paid ones it left", func(t *testing.T) {
+		s, repo := newService(newJob())
+		inv := &fakeInvoices{paid: []string{"inv-paid"}}
+		s.WithInvoices(inv)
 		to := dt("2026-10-03")
-		if _, err := s.UpdateOccurrence(ctx, jobID, dt("2026-10-02"), service.UpdateOccurrenceRequest{Status: service.StatusRescheduled, RescheduledTo: &to}); err != nil {
+		saved, err := s.UpdateOccurrence(ctx, jobID, dt("2026-10-02"), service.UpdateOccurrenceRequest{Status: service.StatusRescheduled, RescheduledTo: &to})
+		if err != nil {
 			t.Fatal(err)
 		}
-		if len(voider.voided) != 0 {
-			t.Fatalf("void calls %+v", voider.voided)
+		if len(inv.voided) != 0 {
+			t.Fatalf("a reschedule must not void: %+v", inv.voided)
+		}
+		if len(inv.moved) != 1 || inv.moved[0].jobID != jobID || !inv.moved[0].from.Equal(dt("2026-10-02")) || !inv.moved[0].to.Equal(to) {
+			t.Fatalf("move calls %+v", inv.moved)
+		}
+		if !reflect.DeepEqual(saved.PaidInvoiceIDs, []string{"inv-paid"}) || repo.byDate("2026-10-03") == nil {
+			t.Fatalf("saved %+v", saved)
+		}
+	})
+
+	t.Run("a failure while moving rolls the reschedule back", func(t *testing.T) {
+		boom := errors.New("db down")
+		for name, inv := range map[string]*fakeInvoices{
+			"move fails":   {moveErr: boom},
+			"lookup fails": {paidErr: boom},
+		} {
+			s, repo := newService(newJob())
+			s.WithInvoices(inv)
+			to := dt("2026-10-03")
+			if _, err := s.UpdateOccurrence(ctx, jobID, dt("2026-10-02"), service.UpdateOccurrenceRequest{Status: service.StatusRescheduled, RescheduledTo: &to}); !errors.Is(err, boom) {
+				t.Errorf("%s: %v", name, err)
+			}
+			if repo.byDate("2026-10-02") != nil || repo.byDate("2026-10-03") != nil {
+				t.Errorf("%s: the reschedule stayed although its invoices were not handled", name)
+			}
 		}
 	})
 
 	t.Run("a failure while voiding rolls the status change back", func(t *testing.T) {
 		boom := errors.New("db down")
-		for name, voider := range map[string]*fakeVoider{
+		for name, voider := range map[string]*fakeInvoices{
 			"void fails":   {voidErr: boom},
 			"lookup fails": {paidErr: boom},
 		} {
@@ -1154,6 +1190,100 @@ func TestCancelingOrTerminatingAnOccurrenceVoidsItsInvoices(t *testing.T) {
 			if repo.byDate("2026-10-02") != nil {
 				t.Errorf("%s: the occurrence stayed canceled although its invoices were not handled", name)
 			}
+		}
+	})
+}
+
+func TestOccurrencesUseTheTenantsToday(t *testing.T) {
+	ctx := context.Background()
+	id := uid("a4")
+	// fixedNow is 2026-10-02 12:00Z; the tenant's calendar differs from UTC's.
+	complete := func(today fakeToday, date string) error {
+		s, _ := newService(mockJobs{id: unconfirmed(oneOff(id, date))})
+		_, err := s.WithToday(today).UpdateOccurrence(ctx, id, dt(date), upd(service.StatusCompleted))
+		return err
+	}
+	// UTC+14: it is already the 3rd, so the 3rd can be completed.
+	if err := complete(fakeToday{day: dt("2026-10-03")}, "2026-10-03"); err != nil {
+		t.Errorf("local today ahead of UTC: %v", err)
+	}
+	// UTC-8 early morning: still the 1st, so the 2nd is the future.
+	if got := statusOf(t, complete(fakeToday{day: dt("2026-10-01")}, "2026-10-02")); got != 400 {
+		t.Errorf("UTC today but local tomorrow: status %d, want 400", got)
+	}
+
+	boom := errors.New("boom")
+	if err := complete(fakeToday{err: boom}, "2026-10-01"); !errors.Is(err, boom) {
+		t.Errorf("update, provider failure: %v", err)
+	}
+	s, _ := newService(mockJobs{id: unconfirmed(oneOff(id, "2026-10-01"))})
+	s.WithToday(fakeToday{err: boom})
+	if _, err := s.Schedule(ctx, id, service.ScheduleQuery{Limit: 10}); !errors.Is(err, boom) {
+		t.Errorf("schedule, provider failure: %v", err)
+	}
+	if err := s.AvailableFor(ctx, id, dt("2026-10-01")); !errors.Is(err, boom) {
+		t.Errorf("availability, provider failure: %v", err)
+	}
+}
+
+func (m *memOccRepo) LockOccurrence(_ context.Context, _ string, date time.Time) error {
+	m.log = append(m.log, "lock:"+date.Format("2006-01-02"))
+	return m.lockErr
+}
+
+func TestOccurrenceChangesTakeTheOccurrenceLockFirst(t *testing.T) {
+	ctx := context.Background()
+	jobID := uid("b2")
+	newJob := func() mockJobs {
+		job := recJob(jobID, "2026-10-02", recurrence.Rule{Frequency: "weekly", WeeklyPeriod: "every", WeeklyDaysOfWeek: []int{5}})
+		job.Status = service.StatusUnconfirmed
+		return mockJobs{jobID: job}
+	}
+	to := dt("2026-10-03")
+	tests := []struct {
+		name string
+		req  service.UpdateOccurrenceRequest
+	}{
+		{"confirmed", upd(service.StatusConfirmed)},
+		{"completed", upd(service.StatusCompleted)},
+		{"canceled", upd(service.StatusCanceled)},
+		{"terminate_service", upd(service.StatusTerminateService)},
+		{"rescheduled", service.UpdateOccurrenceRequest{Status: service.StatusRescheduled, RescheduledTo: &to}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name+": the lock for the changed date is the first thing in the transaction", func(t *testing.T) {
+			s, repo := newService(newJob())
+			s.WithInvoices(&fakeInvoices{})
+			if _, err := s.UpdateOccurrence(ctx, jobID, dt("2026-10-02"), tt.req); err != nil {
+				t.Fatal(err)
+			}
+			if len(repo.log) < 2 || repo.log[0] != "lock:2026-10-02" {
+				t.Fatalf("calls %v", repo.log)
+			}
+		})
+	}
+
+	t.Run("a failing lock changes nothing", func(t *testing.T) {
+		boom := errors.New("lock timeout")
+		s, repo := newService(newJob())
+		inv := &fakeInvoices{}
+		s.WithInvoices(inv)
+		repo.lockErr = boom
+		if _, err := s.UpdateOccurrence(ctx, jobID, dt("2026-10-02"), upd(service.StatusCanceled)); !errors.Is(err, boom) {
+			t.Fatalf("got %v", err)
+		}
+		if repo.byDate("2026-10-02") != nil || len(inv.voided) != 0 {
+			t.Fatal("the occurrence or its invoices changed although the lock failed")
+		}
+	})
+
+	t.Run("rejected changes never take the lock", func(t *testing.T) {
+		s, repo := newService(newJob())
+		if _, err := s.UpdateOccurrence(ctx, jobID, dt("2026-10-02"), upd("nonsense")); err == nil {
+			t.Fatal("expected an error")
+		}
+		if len(repo.log) != 0 {
+			t.Fatalf("calls %v", repo.log)
 		}
 	})
 }

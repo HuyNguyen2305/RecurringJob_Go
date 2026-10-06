@@ -14,7 +14,7 @@ import (
 )
 
 // realMigrations are the files in the repository's migrations folder, in order.
-var realMigrations = []string{"0001_reference_data.sql", "0002_jobs_and_occurrences.sql", "0003_customer_documents.sql"}
+var realMigrations = []string{"0001_reference_data.sql", "0002_jobs_and_occurrences.sql", "0003_customer_documents.sql", "0004_tenant_settings.sql", "0005_document_lifecycle.sql"}
 
 func TestMain(m *testing.M) {
 	helpers.ApplyLocalTZ()

@@ -49,6 +49,14 @@ type CustomerDocument struct {
 	JobSnapshot    *JobSnapshot `gorm:"type:jsonb;serializer:json"`
 	OccurrenceDate *time.Time   `gorm:"type:date"`
 
+	// Number (EST-000123 / INV-000123) is given by the database on insert.
+	Number   string `gorm:"not null;default:(-)"`
+	Revision int    `gorm:"not null;default:1"` // grows with each edit of a sent or approved estimate
+
+	SentAt     *time.Time
+	PaidAt     *time.Time
+	RefundedAt *time.Time
+
 	CreatedAt time.Time
 	UpdatedAt time.Time
 

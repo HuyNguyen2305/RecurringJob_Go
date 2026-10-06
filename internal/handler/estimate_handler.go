@@ -16,6 +16,8 @@ type EstimateService interface {
 	DocumentService
 	Create(ctx context.Context, in service.EstimateInput) (*model.CustomerDocument, error)
 	Approve(ctx context.Context, id string, in service.ApproveEstimateInput) (*model.CustomerDocument, error)
+	Reopen(ctx context.Context, id string) (*model.CustomerDocument, error)
+	Revisions(ctx context.Context, id string) ([]model.DocumentRevision, error)
 }
 
 // EstimateHandler serves /estimates; the endpoints shared with invoices
@@ -86,4 +88,41 @@ func (h *EstimateHandler) Approve(c *gin.Context) {
 		return
 	}
 	ok(c, "estimate approved", dto.NewDocumentResponse(doc))
+}
+
+// Reopen godoc
+// @Summary  Undo an approval: delete the job and return the estimate to sent
+// @Tags     estimates
+// @Produce  json
+// @Param    id path string true "estimate id"
+// @Success  200 {object} map[string]any
+// @Failure  400 {object} map[string]any
+// @Failure  404 {object} map[string]any
+// @Failure  409 {object} map[string]any
+// @Router   /estimates/{id}/reopen [post]
+func (h *EstimateHandler) Reopen(c *gin.Context) {
+	doc, err := h.estimates.Reopen(c.Request.Context(), c.Param("id"))
+	if err != nil {
+		fail(c, err)
+		return
+	}
+	ok(c, "estimate reopened", dto.NewDocumentResponse(doc))
+}
+
+// Revisions godoc
+// @Summary  What the estimate said before each edit, newest first
+// @Tags     estimates
+// @Produce  json
+// @Param    id path string true "estimate id"
+// @Success  200 {object} map[string]any
+// @Failure  400 {object} map[string]any
+// @Failure  404 {object} map[string]any
+// @Router   /estimates/{id}/revisions [get]
+func (h *EstimateHandler) Revisions(c *gin.Context) {
+	revs, err := h.estimates.Revisions(c.Request.Context(), c.Param("id"))
+	if err != nil {
+		fail(c, err)
+		return
+	}
+	ok(c, "revisions", dto.NewRevisionResponses(revs))
 }

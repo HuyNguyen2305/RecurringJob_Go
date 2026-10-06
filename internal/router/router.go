@@ -11,6 +11,7 @@ import (
 
 // Handlers are the HTTP handlers the router serves.
 type Handlers struct {
+	Settings     *handler.SettingsHandler
 	Customers    *handler.CustomerHandler
 	ServiceTypes *handler.ServiceTypeHandler
 	Jobs         *handler.JobHandler
@@ -24,6 +25,9 @@ type Handlers struct {
 func New(defaultSchema string, h Handlers) *gin.Engine {
 	r := gin.New()
 	r.Use(gin.Recovery(), apperror.ErrorHandler(), auth.TenantSchema(defaultSchema))
+
+	r.GET("/settings", h.Settings.Get)
+	r.PUT("/settings", h.Settings.Update)
 
 	c := r.Group("/customers")
 	c.POST("", h.Customers.Create)
@@ -50,6 +54,9 @@ func New(defaultSchema string, h Handlers) *gin.Engine {
 	e.GET("/:id", h.Estimates.Get)
 	e.PATCH("/:id", h.Estimates.Update)
 	e.PATCH("/:id/status", h.Estimates.Status)
+	e.DELETE("/:id", h.Estimates.Delete)
+	e.GET("/:id/revisions", h.Estimates.Revisions)
+	e.POST("/:id/reopen", h.Estimates.Reopen)
 	e.POST("/:id/approve", h.Estimates.Approve)
 
 	i := r.Group("/invoices")
@@ -57,5 +64,6 @@ func New(defaultSchema string, h Handlers) *gin.Engine {
 	i.GET("/:id", h.Invoices.Get)
 	i.PATCH("/:id", h.Invoices.Update)
 	i.PATCH("/:id/status", h.Invoices.Status)
+	i.DELETE("/:id", h.Invoices.Delete)
 	return r
 }

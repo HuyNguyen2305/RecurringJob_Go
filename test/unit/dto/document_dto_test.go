@@ -1,6 +1,8 @@
 package dto_test
 
 import (
+	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -91,6 +93,41 @@ func TestNewDocumentResponses(t *testing.T) {
 	}
 	got := dto.NewDocumentResponses([]model.CustomerDocument{{ID: "a"}, {ID: "b"}})
 	if len(got) != 2 || got[0].ID != "a" || got[1].ID != "b" {
+		t.Fatalf("got %+v", got)
+	}
+}
+
+func TestDocumentResponseLifecycleFields(t *testing.T) {
+	sent := time.Date(2026, 10, 2, 9, 0, 0, 0, time.FixedZone("+7", 7*3600))
+	got := dto.NewDocumentResponse(&model.CustomerDocument{ID: "d", Number: "INV-000007", Revision: 3, SentAt: &sent})
+	if got.Number != "INV-000007" || got.Revision != 3 || got.SentAt == nil || !got.SentAt.Equal(sent) || got.SentAt.Location() != time.UTC {
+		t.Fatalf("got %+v", got)
+	}
+	if got.PaidAt != nil || got.RefundedAt != nil {
+		t.Fatalf("unset timestamps must be null: %+v", got)
+	}
+	raw, _ := json.Marshal(got)
+	for _, want := range []string{`"number":"INV-000007"`, `"revision":3`, `"sentAt":"2026-10-02T02:00:00Z"`, `"paidAt":null`, `"refundedAt":null`} {
+		if !strings.Contains(string(raw), want) {
+			t.Errorf("json lacks %s: %s", want, raw)
+		}
+	}
+}
+
+func TestRevisionResponses(t *testing.T) {
+	if got := dto.NewRevisionResponses(nil); got == nil || len(got) != 0 {
+		t.Fatalf("nil list: %#v", got)
+	}
+	at := time.Date(2026, 10, 2, 9, 0, 0, 0, time.UTC)
+	got := dto.NewRevisionResponses([]model.DocumentRevision{{
+		Revision: 2, CreatedAt: at,
+		Content: model.RevisionContent{
+			Notes: "old", CustomerID: "c", LocationID: "l", ServiceTypeID: "s",
+			LineItems: []model.RevisionLine{{Description: "A", Quantity: 2, UnitPriceCents: 150}, {Description: "B", Quantity: 1, UnitPriceCents: 50}},
+		},
+	}})
+	if len(got) != 1 || got[0].Revision != 2 || got[0].Notes != "old" || got[0].CustomerID != "c" || got[0].TotalCents != 350 ||
+		len(got[0].LineItems) != 2 || got[0].LineItems[0].TotalCents != 300 || !got[0].ReplacedAt.Equal(at) {
 		t.Fatalf("got %+v", got)
 	}
 }

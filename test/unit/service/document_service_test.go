@@ -31,6 +31,18 @@ type memDocs struct {
 	idsStatus    string
 	existsStatus string
 	lastAllowed  []string
+	events       []string // LockOccurrence calls, in order
+	lockErr      error
+	moveCalls    []moveCall
+	movedN       int64
+	listFilter   model.DocumentFilter
+	deleted      []string
+	deleteRows   int64 // -1: report 0 rows (lost the race)
+	countN       int64
+	revisions    []model.DocumentRevision
+	revisionErr  error
+	reopened     []string
+	lastUpdates  map[string]any
 	listArgs     struct {
 		status        string
 		limit, offset int
@@ -41,7 +53,7 @@ func newMemDocs() *memDocs { return &memDocs{docs: map[string]*model.CustomerDoc
 
 func (m *memDocs) put(status string, items ...model.CustomerLineItem) *model.CustomerDocument {
 	m.seq++
-	d := &model.CustomerDocument{ID: uid(fmt.Sprintf("%02d", m.seq)), Status: status, CustomerID: refCustomer, LocationID: refLocation, ServiceTypeID: refService, LineItems: items}
+	d := &model.CustomerDocument{ID: uid(fmt.Sprintf("%02d", m.seq)), Revision: 1, Status: status, CustomerID: refCustomer, LocationID: refLocation, ServiceTypeID: refService, LineItems: items}
 	m.docs[d.ID] = d
 	return d
 }
@@ -57,6 +69,7 @@ func (m *memDocs) Create(_ context.Context, d *model.CustomerDocument) error {
 	m.seq++
 	d.ID = uid(fmt.Sprintf("%02d", m.seq))
 	m.docs[d.ID] = d
+	m.events = append(m.events, "create")
 	return nil
 }
 
@@ -72,8 +85,9 @@ func (m *memDocs) Get(_ context.Context, id string) (*model.CustomerDocument, er
 	return &cp, nil
 }
 
-func (m *memDocs) List(_ context.Context, status string, limit, offset int) ([]model.CustomerDocument, error) {
-	m.listArgs.status, m.listArgs.limit, m.listArgs.offset = status, limit, offset
+func (m *memDocs) List(_ context.Context, f model.DocumentFilter, limit, offset int) ([]model.CustomerDocument, error) {
+	m.listArgs.status, m.listArgs.limit, m.listArgs.offset = f.Status, limit, offset
+	m.listFilter = f
 	return []model.CustomerDocument{}, nil
 }
 
@@ -89,6 +103,9 @@ func (m *memDocs) UpdateContent(_ context.Context, id string, allowedFrom []stri
 	if v, ok := fields["customer_id"]; ok {
 		d.CustomerID, d.LocationID, d.ServiceTypeID = v.(string), fields["location_id"].(string), fields["service_type_id"].(string)
 	}
+	if v, ok := fields["revision"]; ok {
+		d.Revision = v.(int)
+	}
 	if v, ok := fields["notes"]; ok {
 		d.Notes = v.(string)
 	}
@@ -99,7 +116,7 @@ func (m *memDocs) UpdateContent(_ context.Context, id string, allowedFrom []stri
 }
 
 func (m *memDocs) UpdateStatusGuarded(_ context.Context, id string, allowedFrom []string, updates map[string]any) (int64, error) {
-	m.lastAllowed = allowedFrom
+	m.lastAllowed, m.lastUpdates = allowedFrom, updates
 	if m.updateErr != nil {
 		return 0, m.updateErr
 	}
@@ -125,6 +142,7 @@ func (m *memDocs) MarkApproved(_ context.Context, id string, allowedFrom []strin
 
 func (m *memDocs) Transaction(ctx context.Context, fn func(ctx context.Context) error) error {
 	m.transacted++
+	m.events = append(m.events, "begin")
 	return fn(ctx)
 }
 
@@ -401,4 +419,229 @@ func (f *fakeRefs) Resolve(_ context.Context, customerID, locationID, serviceTyp
 		Location:    &model.Location{ID: locationID, CustomerID: customerID, AddressLine1: "1 Main Street"},
 		ServiceType: &model.ServiceType{ID: serviceTypeID, Name: "Window cleaning"},
 	}, nil
+}
+
+// moveCall records one MoveUnpaidForOccurrence call.
+type moveCall struct {
+	jobID    string
+	from, to time.Time
+}
+
+func (m *memDocs) MoveUnpaidForOccurrence(_ context.Context, jobID string, from, to time.Time) (int64, error) {
+	m.moveCalls = append(m.moveCalls, moveCall{jobID, from, to})
+	return m.movedN, m.occErr
+}
+
+func (m *memDocs) LockOccurrence(_ context.Context, jobID string, date time.Time) error {
+	m.events = append(m.events, "lock:"+jobID+":"+date.Format("2006-01-02"))
+	return m.lockErr
+}
+
+func (m *memDocs) DeleteGuarded(_ context.Context, id string, allowedFrom []string) (int64, error) {
+	m.events = append(m.events, "delete")
+	if m.updateErr != nil {
+		return 0, m.updateErr
+	}
+	d := m.docs[id]
+	if m.deleteRows < 0 || d == nil || !hasString(allowedFrom, d.Status) {
+		return 0, nil
+	}
+	delete(m.docs, id)
+	m.deleted = append(m.deleted, id)
+	return 1, nil
+}
+
+func (m *memDocs) CountForJob(context.Context, string) (int64, error) { return m.countN, m.occErr }
+
+func (m *memDocs) MarkReopened(_ context.Context, id string, allowedFrom []string, status string) (int64, error) {
+	m.events = append(m.events, "reopen")
+	m.lastAllowed = allowedFrom
+	if m.updateErr != nil {
+		return 0, m.updateErr
+	}
+	d := m.docs[id]
+	if m.zeroRows || d == nil || !hasString(allowedFrom, d.Status) {
+		return 0, nil
+	}
+	d.Status, d.JobID, d.JobSnapshot = status, nil, nil
+	m.reopened = append(m.reopened, id)
+	return 1, nil
+}
+
+func (m *memDocs) SaveRevision(_ context.Context, rev *model.DocumentRevision) error {
+	m.events = append(m.events, "revision")
+	if m.revisionErr != nil {
+		return m.revisionErr
+	}
+	m.revisions = append(m.revisions, *rev)
+	return nil
+}
+
+func (m *memDocs) ListRevisions(_ context.Context, id string) ([]model.DocumentRevision, error) {
+	out := []model.DocumentRevision{}
+	for i := len(m.revisions) - 1; i >= 0; i-- {
+		if m.revisions[i].DocumentID == id {
+			out = append(out, m.revisions[i])
+		}
+	}
+	return out, m.revisionErr
+}
+
+func TestDocumentListFilters(t *testing.T) {
+	ctx := context.Background()
+	store := newMemDocs()
+	invoices := newDocCore(store)
+	estimates := newEstimateService(store, &fakeJobCreator{})
+
+	t.Run("filters reach the store, with the search text trimmed", func(t *testing.T) {
+		q := service.DocumentListQuery{
+			Status: "sent", CustomerID: refCustomer, LocationID: refLocation, JobID: uid("a1"), Q: "  ada ",
+			OccurrenceFrom: dt("2026-10-01"), OccurrenceTo: dt("2026-10-31"),
+		}
+		if _, err := invoices.List(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+		want := model.DocumentFilter{
+			Status: "sent", CustomerID: refCustomer, LocationID: refLocation, JobID: uid("a1"), Q: "ada",
+			OccurrenceFrom: dt("2026-10-01"), OccurrenceTo: dt("2026-10-31"),
+		}
+		if store.listFilter != want {
+			t.Fatalf("filter %+v, want %+v", store.listFilter, want)
+		}
+	})
+
+	t.Run("rejections", func(t *testing.T) {
+		tests := []struct {
+			name string
+			svc  interface {
+				List(context.Context, service.DocumentListQuery) ([]model.CustomerDocument, error)
+			}
+			q service.DocumentListQuery
+		}{
+			{"malformed customer id", invoices, service.DocumentListQuery{CustomerID: "nope"}},
+			{"malformed location id", invoices, service.DocumentListQuery{LocationID: "nope"}},
+			{"malformed job id", invoices, service.DocumentListQuery{JobID: "nope"}},
+			{"search text too long", invoices, service.DocumentListQuery{Q: strings.Repeat("a", 101)}},
+			{"from after to", invoices, service.DocumentListQuery{OccurrenceFrom: dt("2026-10-02"), OccurrenceTo: dt("2026-10-01")}},
+			{"occurrence range on estimates (from)", estimates, service.DocumentListQuery{OccurrenceFrom: dt("2026-10-01")}},
+			{"occurrence range on estimates (to)", estimates, service.DocumentListQuery{OccurrenceTo: dt("2026-10-01")}},
+		}
+		for _, tt := range tests {
+			if _, err := tt.svc.List(ctx, tt.q); statusOf(t, err) != 400 {
+				t.Errorf("%s: %v", tt.name, err)
+			}
+		}
+	})
+
+	t.Run("a 100-character search and an equal from/to are fine", func(t *testing.T) {
+		q := service.DocumentListQuery{Q: strings.Repeat("é", 100), OccurrenceFrom: dt("2026-10-01"), OccurrenceTo: dt("2026-10-01")}
+		if _, err := invoices.List(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
+func TestDocumentDelete(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("a draft is deleted in one locked transaction", func(t *testing.T) {
+		store := newMemDocs()
+		d := store.put("draft", oneItem())
+		if err := newDocCore(store).Delete(ctx, d.ID); err != nil {
+			t.Fatal(err)
+		}
+		if len(store.docs) != 0 || store.locked != 1 || store.transacted != 1 {
+			t.Fatalf("docs=%d locked=%d transacted=%d", len(store.docs), store.locked, store.transacted)
+		}
+	})
+
+	t.Run("anything past draft is refused and kept", func(t *testing.T) {
+		for _, status := range []string{"sent", "paid", "refunded", "void"} {
+			store := newMemDocs()
+			d := store.put(status, oneItem())
+			if err := newDocCore(store).Delete(ctx, d.ID); statusOf(t, err) != 409 {
+				t.Errorf("%s: %v", status, err)
+			}
+			if len(store.docs) != 1 || len(store.deleted) != 0 {
+				t.Errorf("%s: the document was deleted", status)
+			}
+		}
+	})
+
+	t.Run("malformed and unknown ids", func(t *testing.T) {
+		store := newMemDocs()
+		if err := newDocCore(store).Delete(ctx, "nope"); statusOf(t, err) != 400 {
+			t.Errorf("malformed: %v", err)
+		}
+		if err := newDocCore(store).Delete(ctx, uid("ff")); statusOf(t, err) != 404 {
+			t.Errorf("unknown: %v", err)
+		}
+	})
+
+	t.Run("losing the race to another change is a 409", func(t *testing.T) {
+		store := newMemDocs()
+		d := store.put("draft", oneItem())
+		store.deleteRows = -1
+		if err := newDocCore(store).Delete(ctx, d.ID); statusOf(t, err) != 409 {
+			t.Fatalf("got %v", err)
+		}
+	})
+
+	t.Run("a store failure comes back as is", func(t *testing.T) {
+		store := newMemDocs()
+		d := store.put("draft", oneItem())
+		store.updateErr = errors.New("db down")
+		if err := newDocCore(store).Delete(ctx, d.ID); !errors.Is(err, store.updateErr) {
+			t.Fatalf("got %v", err)
+		}
+	})
+}
+
+func TestChangeStatusRecordsWhenItHappened(t *testing.T) {
+	ctx := context.Background()
+	tests := []struct {
+		from, to string
+		column   string // the timestamp column set, "" for none
+	}{
+		{"draft", "sent", "sent_at"},
+		{"sent", "paid", "paid_at"},
+		{"paid", "refunded", "refunded_at"},
+		{"draft", "void", ""},
+		{"sent", "void", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.from+" to "+tt.to, func(t *testing.T) {
+			store := newMemDocs()
+			d := store.put(tt.from, oneItem())
+			before := time.Now().UTC().Add(-time.Second)
+			if _, err := newDocCore(store).ChangeStatus(ctx, d.ID, tt.to); err != nil {
+				t.Fatal(err)
+			}
+			stamps := 0
+			for _, col := range []string{"sent_at", "paid_at", "refunded_at"} {
+				v, has := store.lastUpdates[col]
+				if has {
+					stamps++
+				}
+				if col == tt.column {
+					at, _ := v.(time.Time)
+					if !has || at.Before(before) || at.After(time.Now().UTC().Add(time.Second)) {
+						t.Fatalf("%s = %v", col, v)
+					}
+				}
+			}
+			if wantStamps := map[bool]int{true: 1, false: 0}[tt.column != ""]; stamps != wantStamps {
+				t.Fatalf("timestamps set: %v", store.lastUpdates)
+			}
+		})
+	}
+
+	t.Run("a refused change records nothing", func(t *testing.T) {
+		store := newMemDocs()
+		d := store.put("draft", oneItem())
+		store.lastUpdates = nil
+		if _, err := newDocCore(store).ChangeStatus(ctx, d.ID, "refunded"); statusOf(t, err) != 409 || store.lastUpdates != nil {
+			t.Fatalf("err=%v updates=%v", err, store.lastUpdates)
+		}
+	})
 }

@@ -475,13 +475,15 @@ func TestE2EInvoiceCanBePaidBeforeTheWorkIsDone(t *testing.T) {
 	}
 }
 
+// A one-off job's estimate closes once its invoice is paid (a recurring
+// job's never does: see TestE2ERecurringEstimateStaysEditable).
 func TestE2EEstimateStaysEditableUntilAnInvoiceIsPaid(t *testing.T) {
 	c, _, _ := newClient(t)
 	today := civil.Format(civil.Today())
 
 	est := c.post("/estimates", draftBody).expect(t, 200).obj()["id"].(string)
 	c.patch("/estimates/"+est+"/status", `{"status":"sent"}`).expect(t, 200)
-	approved := c.post("/estimates/"+est+"/approve", fmt.Sprintf(`{"date":%q,"recurrence":{"frequency":"daily"}}`, today)).expect(t, 200).obj()
+	approved := c.post("/estimates/"+est+"/approve", fmt.Sprintf(`{"date":%q}`, today)).expect(t, 200).obj() // a one-off job
 	job, _ := approved["jobId"].(string)
 
 	edit := func(notes string, want int) resp {
@@ -606,4 +608,166 @@ func streetOf(v any) string {
 	m, _ := v.(map[string]any)
 	s, _ := m["addressLine1"].(string)
 	return s
+}
+
+func TestE2ERecurringEstimateStaysEditable(t *testing.T) {
+	c, _, _ := newClient(t)
+	today := civil.Format(civil.Today())
+
+	est := c.post("/estimates", draftBody).expect(t, 200).obj()["id"].(string)
+	c.patch("/estimates/"+est+"/status", `{"status":"sent"}`).expect(t, 200)
+	approved := c.post("/estimates/"+est+"/approve", fmt.Sprintf(`{"date":%q,"recurrence":{"frequency":"daily"}}`, today)).expect(t, 200).obj()
+	job, _ := approved["jobId"].(string)
+
+	inv := invoiceFor(t, c, job, today)
+	c.patch("/invoices/"+inv+"/status", `{"status":"sent"}`).expect(t, 200)
+	c.patch("/invoices/"+inv+"/status", `{"status":"paid"}`).expect(t, 200)
+
+	// One paid visit does not freeze the template of the whole series.
+	c.patch("/estimates/"+est, `{"notes":"next visits cost more"}`).expect(t, 200)
+	if e := c.get("/estimates/"+est).expect(t, 200).obj(); e["notes"] != "next visits cost more" {
+		t.Fatalf("estimate: %v", e)
+	}
+	// The invoice that was paid is not rewritten.
+	if got := c.get("/invoices/"+inv).expect(t, 200).obj(); got["status"] != "paid" || got["totalCents"] != float64(17500) {
+		t.Fatalf("invoice: %v", got)
+	}
+}
+
+func TestE2ERescheduleMovesUnpaidInvoices(t *testing.T) {
+	today := civil.Format(civil.Today())
+	later := civil.Format(civil.AddDays(civil.Today(), 3))
+	reschedule := `{"status":"rescheduled","rescheduledTo":"` + later + `"}`
+	oneOff := func(c client) string {
+		return c.post("/jobs", fmt.Sprintf(`{"date":%q}`, today)).expect(t, 200).obj()["id"].(string)
+	}
+	dateOf := func(c client, id string) any { return c.get("/invoices/"+id).expect(t, 200).obj()["occurrenceDate"] }
+
+	t.Run("a draft invoice follows the visit and can be worked on the new date", func(t *testing.T) {
+		c, _, _ := newClient(t)
+		job := oneOff(c)
+		inv := invoiceFor(t, c, job, today)
+		res := c.patch("/jobs/"+job+"/occurrences/"+today, reschedule).expect(t, 200)
+		res.envelope(t)
+		if _, has := res.obj()["paidInvoiceIds"]; has {
+			t.Fatalf("nothing was paid: %s", res.raw)
+		}
+		if dateOf(c, inv) != later || invoiceStatus(t, c, inv) != "draft" {
+			t.Fatalf("invoice: %v", c.get("/invoices/"+inv).obj())
+		}
+		c.patch("/invoices/"+inv+"/status", `{"status":"sent"}`).expect(t, 200)
+		// The old date is free of live invoices and refuses new ones (it was rescheduled).
+		c.post("/jobs/"+job+"/occurrences/"+today+"/invoice", draftBody).expect(t, 409)
+		// A second invoice for the new date is refused: the moved one is live there.
+		c.post("/jobs/"+job+"/occurrences/"+later+"/invoice", draftBody).expect(t, 409)
+	})
+
+	t.Run("a sent invoice moves too", func(t *testing.T) {
+		c, _, _ := newClient(t)
+		job := oneOff(c)
+		inv := invoiceFor(t, c, job, today)
+		c.patch("/invoices/"+inv+"/status", `{"status":"sent"}`).expect(t, 200)
+		c.patch("/jobs/"+job+"/occurrences/"+today, reschedule).expect(t, 200)
+		if dateOf(c, inv) != later || invoiceStatus(t, c, inv) != "sent" {
+			t.Fatalf("invoice: %v", c.get("/invoices/"+inv).obj())
+		}
+	})
+
+	t.Run("a paid invoice stays on the old date and is flagged", func(t *testing.T) {
+		c, _, _ := newClient(t)
+		job := oneOff(c)
+		inv := invoiceFor(t, c, job, today)
+		c.patch("/invoices/"+inv+"/status", `{"status":"sent"}`).expect(t, 200)
+		c.patch("/invoices/"+inv+"/status", `{"status":"paid"}`).expect(t, 200)
+		res := c.patch("/jobs/"+job+"/occurrences/"+today, reschedule).expect(t, 200)
+		flagged, _ := res.obj()["paidInvoiceIds"].([]any)
+		if len(flagged) != 1 || flagged[0] != inv {
+			t.Fatalf("paidInvoiceIds: %s", res.raw)
+		}
+		if dateOf(c, inv) != today || invoiceStatus(t, c, inv) != "paid" {
+			t.Fatalf("invoice: %v", c.get("/invoices/"+inv).obj())
+		}
+	})
+
+	t.Run("only that occurrence's invoices move", func(t *testing.T) {
+		c, _, _ := newClient(t)
+		job, other := oneOff(c), oneOff(c)
+		mine, theirs := invoiceFor(t, c, job, today), invoiceFor(t, c, other, today)
+		c.patch("/jobs/"+job+"/occurrences/"+today, reschedule).expect(t, 200)
+		if dateOf(c, mine) != later || dateOf(c, theirs) != today {
+			t.Fatal("rescheduling one job's visit moved another job's invoice")
+		}
+	})
+
+	t.Run("a refused reschedule moves nothing", func(t *testing.T) {
+		c, _, _ := newClient(t)
+		job := oneOff(c)
+		inv := invoiceFor(t, c, job, today)
+		c.patch("/jobs/"+job+"/occurrences/"+today, `{"status":"rescheduled","rescheduledTo":"`+today+`"}`).expect(t, 400)
+		if dateOf(c, inv) != today {
+			t.Fatalf("the invoice moved although the reschedule was refused: %v", dateOf(c, inv))
+		}
+	})
+}
+
+// Creating an invoice and changing the same occurrence's status at the same
+// time must never leave a live invoice on a visit that no longer happens.
+func TestE2EInvoiceRacingAStatusChange(t *testing.T) {
+	today := civil.Format(civil.Today())
+	later := civil.Format(civil.AddDays(civil.Today(), 3))
+	c, _, _ := newClient(t)
+
+	race := func(status string) (invoice resp, change resp, job string) {
+		job = c.post("/jobs", fmt.Sprintf(`{"date":%q}`, today)).expect(t, 200).obj()["id"].(string)
+		body := fmt.Sprintf(`{"status":%q}`, status)
+		if status == "rescheduled" {
+			body = `{"status":"rescheduled","rescheduledTo":"` + later + `"}`
+		}
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			invoice = c.post("/jobs/"+job+"/occurrences/"+today+"/invoice", draftBody)
+		}()
+		go func() {
+			defer wg.Done()
+			change = c.patch("/jobs/"+job+"/occurrences/"+today, body)
+		}()
+		wg.Wait()
+		return invoice, change, job
+	}
+
+	for round := 0; round < 25; round++ {
+		invoice, change, _ := race("canceled")
+		if change.code != 200 {
+			t.Fatalf("round %d: cancel %d: %s", round, change.code, change.raw)
+		}
+		switch invoice.code {
+		case 409: // the cancel won; nothing was created
+		case 200:
+			id := invoice.obj()["id"].(string)
+			if got := invoiceStatus(t, c, id); got != "void" {
+				t.Fatalf("round %d: a live (%s) invoice was left on a canceled occurrence", round, got)
+			}
+		default:
+			t.Fatalf("round %d: invoice %d: %s", round, invoice.code, invoice.raw)
+		}
+	}
+
+	for round := 0; round < 25; round++ {
+		invoice, change, _ := race("rescheduled")
+		if change.code != 200 {
+			t.Fatalf("round %d: reschedule %d: %s", round, change.code, change.raw)
+		}
+		switch invoice.code {
+		case 409: // the reschedule won; nothing was created
+		case 200:
+			id := invoice.obj()["id"].(string)
+			if got := c.get("/invoices/"+id).expect(t, 200).obj(); got["occurrenceDate"] != later || got["status"] != "draft" {
+				t.Fatalf("round %d: the invoice was left behind on the rescheduled date: %v", round, got)
+			}
+		default:
+			t.Fatalf("round %d: invoice %d: %s", round, invoice.code, invoice.raw)
+		}
+	}
 }

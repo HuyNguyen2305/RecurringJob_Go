@@ -2,6 +2,9 @@ package service
 
 import (
 	"context"
+	"strings"
+	"time"
+	"unicode/utf8"
 
 	"recurringjob/internal/common/apperror"
 	"recurringjob/internal/common/civil"
@@ -21,7 +24,7 @@ type DocumentStore interface {
 	// GetForUpdate is Get that locks the row until the surrounding
 	// transaction ends.
 	GetForUpdate(ctx context.Context, id string) (*model.CustomerDocument, error)
-	List(ctx context.Context, status string, limit, offset int) ([]model.CustomerDocument, error)
+	List(ctx context.Context, f model.DocumentFilter, limit, offset int) ([]model.CustomerDocument, error)
 	// UpdateContent updates fields (and replaces line items when items is
 	// non-nil) only while the status is in allowedFrom; it returns the rows
 	// affected.
@@ -29,15 +32,27 @@ type DocumentStore interface {
 	// UpdateStatusGuarded updates only while the status is in allowedFrom and
 	// returns the rows affected.
 	UpdateStatusGuarded(ctx context.Context, id string, allowedFrom []string, updates map[string]any) (int64, error)
+	// DeleteGuarded deletes only while the status is in allowedFrom and
+	// returns the rows affected.
+	DeleteGuarded(ctx context.Context, id string, allowedFrom []string) (int64, error)
 	Transaction(ctx context.Context, fn func(ctx context.Context) error) error
 }
 
 // DocumentListQuery filters and pages a document list.
 type DocumentListQuery struct {
-	Status string
-	Limit  int
-	Offset int
+	Status         string
+	CustomerID     string
+	LocationID     string
+	JobID          string
+	Q              string    // customer name or document number
+	OccurrenceFrom time.Time // invoices only
+	OccurrenceTo   time.Time // invoices only
+	Limit          int
+	Offset         int
 }
+
+// maxSearchLen bounds the free-text filter.
+const maxSearchLen = 100
 
 // documentCore is the behaviour estimates and invoices share: reading,
 // editing and moving through the status transitions. The type-specific
@@ -91,6 +106,23 @@ func (c *documentCore) List(ctx context.Context, q DocumentListQuery) ([]model.C
 	if q.Status != "" && !IsKnownDocumentStatus(c.docType, q.Status) {
 		return nil, apperror.Validation("unknown status")
 	}
+	for name, id := range map[string]string{"customerId": q.CustomerID, "locationId": q.LocationID, "jobId": q.JobID} {
+		if id != "" {
+			if err := ValidateID(name, id); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if utf8.RuneCountInString(q.Q) > maxSearchLen {
+		return nil, bad("q must be at most %d characters", maxSearchLen)
+	}
+	hasFrom, hasTo := !q.OccurrenceFrom.IsZero(), !q.OccurrenceTo.IsZero()
+	if (hasFrom || hasTo) && c.docType != model.DocTypeInvoice {
+		return nil, apperror.Validation("occurrenceFrom and occurrenceTo only apply to invoices")
+	}
+	if hasFrom && hasTo && q.OccurrenceFrom.After(q.OccurrenceTo) {
+		return nil, apperror.Validation("occurrenceFrom cannot be after occurrenceTo")
+	}
 	if q.Limit == 0 {
 		q.Limit = DefaultDocumentLimit
 	}
@@ -100,8 +132,39 @@ func (c *documentCore) List(ctx context.Context, q DocumentListQuery) ([]model.C
 	if q.Offset < 0 {
 		return nil, apperror.Validation("offset cannot be negative")
 	}
-	return c.store.List(ctx, q.Status, q.Limit, q.Offset)
+	return c.store.List(ctx, model.DocumentFilter{
+		Status: q.Status, CustomerID: q.CustomerID, LocationID: q.LocationID, JobID: q.JobID, Q: strings.TrimSpace(q.Q),
+		OccurrenceFrom: q.OccurrenceFrom, OccurrenceTo: q.OccurrenceTo,
+	}, q.Limit, q.Offset)
 }
+
+// Delete removes a draft document (and its line items). Anything past draft
+// is already in front of the customer, so it is declined or voided instead.
+func (c *documentCore) Delete(ctx context.Context, id string) error {
+	if err := ValidateID(c.docType+" id", id); err != nil {
+		return err
+	}
+	return c.store.Transaction(ctx, func(ctx context.Context) error {
+		doc, err := c.store.GetForUpdate(ctx, id)
+		if err != nil {
+			return err
+		}
+		if doc.Status != DocStatusDraft {
+			return apperror.Conflict("only a draft " + c.docType + " can be deleted; this one is " + doc.Status)
+		}
+		n, err := c.store.DeleteGuarded(ctx, id, []string{DocStatusDraft})
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return apperror.Conflict(c.docType + " was changed by another request")
+		}
+		return nil
+	})
+}
+
+// statusTimestamp is the column that records when a document reached status.
+var statusTimestamp = map[string]string{DocStatusSent: "sent_at", DocStatusPaid: "paid_at", DocStatusRefunded: "refunded_at"}
 
 // Update edits the document: the given fields change and a given line-item
 // list replaces the old one. Only the statuses in DocumentEditableFrom allow
@@ -179,7 +242,11 @@ func (c *documentCore) ChangeStatus(ctx context.Context, id, to string) (*model.
 				return err
 			}
 		}
-		n, err := c.store.UpdateStatusGuarded(ctx, id, DocumentAllowedFrom(c.docType, to), map[string]any{"status": to})
+		updates := map[string]any{"status": to}
+		if col, ok := statusTimestamp[to]; ok {
+			updates[col] = time.Now().UTC()
+		}
+		n, err := c.store.UpdateStatusGuarded(ctx, id, DocumentAllowedFrom(c.docType, to), updates)
 		if err != nil {
 			return err
 		}

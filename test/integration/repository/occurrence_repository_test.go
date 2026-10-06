@@ -82,11 +82,10 @@ func TestOccurrenceRepository(t *testing.T) {
 		}
 	})
 
-	t.Run("an unknown job is a foreign-key error, not a 409", func(t *testing.T) {
+	t.Run("an unknown job is a 409 (the job no longer exists)", func(t *testing.T) {
 		err := occs.Create(ctx, row("00000000-0000-0000-0000-0000000000ff", "2026-10-02", "confirmed"))
-		var ae *apperror.AppError
-		if err == nil || errors.As(err, &ae) || pgCode(err) != "23503" {
-			t.Fatalf("got %v (pg %q)", err, pgCode(err))
+		if appStatus(t, err) != 409 {
+			t.Fatalf("got %v", err)
 		}
 	})
 

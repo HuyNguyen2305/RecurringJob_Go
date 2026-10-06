@@ -18,6 +18,7 @@ type DocumentService interface {
 	List(ctx context.Context, q service.DocumentListQuery) ([]model.CustomerDocument, error)
 	Update(ctx context.Context, id string, p service.DocumentPatch) (*model.CustomerDocument, error)
 	ChangeStatus(ctx context.Context, id, to string) (*model.CustomerDocument, error)
+	Delete(ctx context.Context, id string) error
 }
 
 // documentHandler serves the endpoints estimates and invoices share. The
@@ -62,6 +63,12 @@ func (h *documentHandler) Get(c *gin.Context) {
 // @Tags     estimates, invoices
 // @Produce  json
 // @Param    status query string false "filter by status"
+// @Param    customerId query string false "filter by customer"
+// @Param    locationId query string false "filter by location"
+// @Param    jobId query string false "filter by job"
+// @Param    q query string false "customer name or document number contains"
+// @Param    occurrenceFrom query string false "invoices only: occurrence date from, YYYY-MM-DD"
+// @Param    occurrenceTo query string false "invoices only: occurrence date to, YYYY-MM-DD"
 // @Param    limit  query int    false "1..200 (default 50)"
 // @Param    offset query int    false "rows to skip (default 0)"
 // @Success  200 {object} map[string]any
@@ -79,12 +86,44 @@ func (h *documentHandler) List(c *gin.Context) {
 		fail(c, err)
 		return
 	}
-	docs, err := h.docs.List(c.Request.Context(), service.DocumentListQuery{Status: c.Query("status"), Limit: limit, Offset: offset})
+	from, err := optionalDate(c, "occurrenceFrom")
+	if err != nil {
+		fail(c, err)
+		return
+	}
+	to, err := optionalDate(c, "occurrenceTo")
+	if err != nil {
+		fail(c, err)
+		return
+	}
+	docs, err := h.docs.List(c.Request.Context(), service.DocumentListQuery{
+		Status: c.Query("status"), CustomerID: c.Query("customerId"), LocationID: c.Query("locationId"), JobID: c.Query("jobId"),
+		Q: c.Query("q"), OccurrenceFrom: from, OccurrenceTo: to, Limit: limit, Offset: offset,
+	})
 	if err != nil {
 		fail(c, err)
 		return
 	}
 	ok(c, "documents", dto.NewDocumentResponses(docs))
+}
+
+// Delete godoc
+// @Summary  Delete a draft estimate or invoice
+// @Tags     estimates, invoices
+// @Produce  json
+// @Param    id path string true "document id"
+// @Success  200 {object} map[string]any
+// @Failure  400 {object} map[string]any
+// @Failure  404 {object} map[string]any
+// @Failure  409 {object} map[string]any
+// @Router   /estimates/{id} [delete]
+// @Router   /invoices/{id} [delete]
+func (h *documentHandler) Delete(c *gin.Context) {
+	if err := h.docs.Delete(c.Request.Context(), c.Param("id")); err != nil {
+		fail(c, err)
+		return
+	}
+	ok(c, "document deleted", gin.H{"id": c.Param("id")})
 }
 
 // Update godoc

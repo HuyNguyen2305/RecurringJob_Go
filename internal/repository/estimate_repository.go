@@ -19,8 +19,9 @@ func NewEstimateRepository(db *gorm.DB) *EstimateRepository {
 }
 
 // MarkApproved ties the estimate to the job created from it and sets it
-// approved, only while its status is still one of allowedFrom. It returns the
-// rows affected; 0 means the estimate changed under the caller.
+// approved, only while its status is still one of allowedFrom. An estimate
+// that was never marked sent is stamped as sent now: the customer had it.
+// It returns the rows affected; 0 means the estimate changed under the caller.
 func (r *EstimateRepository) MarkApproved(ctx context.Context, id string, allowedFrom []string, status, jobID string, snapshot *model.JobSnapshot) (int64, error) {
 	raw, err := json.Marshal(snapshot)
 	if err != nil {
@@ -30,5 +31,32 @@ func (r *EstimateRepository) MarkApproved(ctx context.Context, id string, allowe
 		"status":       status,
 		"job_id":       jobID,
 		"job_snapshot": string(raw),
+		"sent_at":      gorm.Expr("COALESCE(sent_at, now())"),
 	})
+}
+
+// MarkReopened undoes MarkApproved: the estimate loses its job and snapshot
+// and gets status, only while its status is still one of allowedFrom. It
+// returns the rows affected.
+func (r *EstimateRepository) MarkReopened(ctx context.Context, id string, allowedFrom []string, status string) (int64, error) {
+	return r.UpdateStatusGuarded(ctx, id, allowedFrom, map[string]any{
+		"status":       status,
+		"job_id":       nil,
+		"job_snapshot": nil,
+	})
+}
+
+// SaveRevision stores the estimate's current content as the given revision.
+func (r *EstimateRepository) SaveRevision(ctx context.Context, rev *model.DocumentRevision) error {
+	return r.WithSchema(ctx, func(tx *gorm.DB) error { return tx.Create(rev).Error })
+}
+
+// ListRevisions returns the stored revisions of the estimate, newest first;
+// never nil.
+func (r *EstimateRepository) ListRevisions(ctx context.Context, id string) ([]model.DocumentRevision, error) {
+	out := []model.DocumentRevision{}
+	err := r.WithSchema(ctx, func(tx *gorm.DB) error {
+		return tx.Where("document_id = ?", id).Order("revision DESC").Find(&out).Error
+	})
+	return out, err
 }

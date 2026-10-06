@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"testing"
 	"time"
+	_ "time/tzdata" // zone names must load on hosts without a zone database
 
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"

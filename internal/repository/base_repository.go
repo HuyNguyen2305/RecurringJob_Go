@@ -5,12 +5,15 @@ import (
 	"context"
 	"errors"
 	"regexp"
+	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
 	"gorm.io/gorm"
 
 	"recurringjob/internal/common/apperror"
 	"recurringjob/internal/common/auth"
+	"recurringjob/internal/common/civil"
 )
 
 type txKey struct{}
@@ -53,8 +56,27 @@ func (b BaseRepository) WithSchema(ctx context.Context, fn func(tx *gorm.DB) err
 	})
 }
 
+// LockOccurrence takes a transaction-scoped advisory lock for one occurrence
+// (job + date) of the request's tenant, waiting while another transaction
+// holds it; it is released when the surrounding transaction ends. Locks are
+// database-wide, so the schema is part of the key. Call it inside Transaction.
+func (b BaseRepository) LockOccurrence(ctx context.Context, jobID string, date time.Time) error {
+	return b.WithSchema(ctx, func(tx *gorm.DB) error {
+		return tx.Exec(`SELECT pg_advisory_xact_lock(hashtextextended(current_schema() || ':' || ? || ':' || ?, 0))`,
+			jobID, civil.Format(date)).Error
+	})
+}
+
 // isUniqueViolation reports a Postgres unique_violation (23505).
 func isUniqueViolation(err error) bool {
 	var pgErr *pgconn.PgError
 	return errors.As(err, &pgErr) && pgErr.Code == "23505"
+}
+
+// isForeignKeyViolationOn reports a foreign-key violation (23503, or 23001
+// for a restrict) raised by a constraint whose name contains part, such as
+// "job_id".
+func isForeignKeyViolationOn(err error, part string) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && (pgErr.Code == "23503" || pgErr.Code == "23001") && strings.Contains(pgErr.ConstraintName, part)
 }

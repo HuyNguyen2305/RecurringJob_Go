@@ -8,6 +8,7 @@ const (
 	DocStatusApproved = "approved" // estimate only
 	DocStatusDeclined = "declined" // estimate only
 	DocStatusPaid     = "paid"     // invoice only
+	DocStatusRefunded = "refunded" // invoice only: a paid invoice whose money went back
 	DocStatusVoid     = "void"     // invoice only
 )
 
@@ -22,6 +23,7 @@ var documentTransitions = map[string]map[string][]string{
 	model.DocTypeInvoice: {
 		DocStatusDraft: {DocStatusSent, DocStatusVoid},
 		DocStatusSent:  {DocStatusPaid, DocStatusVoid},
+		DocStatusPaid:  {DocStatusRefunded},
 	},
 }
 
@@ -45,7 +47,7 @@ var estimateApprovableFrom = []string{DocStatusDraft, DocStatusSent}
 // documentStatuses are all statuses of a document type.
 var documentStatuses = map[string][]string{
 	model.DocTypeEstimate: {DocStatusDraft, DocStatusSent, DocStatusApproved, DocStatusDeclined},
-	model.DocTypeInvoice:  {DocStatusDraft, DocStatusSent, DocStatusPaid, DocStatusVoid},
+	model.DocTypeInvoice:  {DocStatusDraft, DocStatusSent, DocStatusPaid, DocStatusRefunded, DocStatusVoid},
 }
 
 // IsKnownDocumentStatus reports whether s is a status of the document type.

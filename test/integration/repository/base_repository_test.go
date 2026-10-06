@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"gorm.io/gorm"
 
@@ -208,4 +209,105 @@ func TestRepositoriesReportDatabaseFailures(t *testing.T) {
 	_, err = occs.UpdateGuarded(ctx, "00000000-0000-0000-0000-0000000000ff", []string{"unconfirmed"}, map[string]any{"status": "confirmed"})
 	notApp("UpdateGuarded", err)
 	notApp("Transaction", occs.Transaction(ctx, func(context.Context) error { return nil }))
+}
+
+func TestLockOccurrence(t *testing.T) {
+	db := helpers.Connect(t)
+	_, ctx := helpers.NewSchema(t, db)
+	_, otherCtx := helpers.NewSchema(t, db)
+	base := repository.NewBaseRepository(db)
+	job := "00000000-0000-0000-0000-0000000000a1"
+	d5, d6 := civil.New(2026, 10, 5), civil.New(2026, 10, 6)
+
+	// tryLock runs a transaction that takes the lock and reports whether it
+	// got it within the wait; the transaction ends when release is closed.
+	tryLock := func(ctx context.Context, jobID string, date time.Time, wait time.Duration) (got bool, release func(), done <-chan error) {
+		acquired, stop, finished := make(chan struct{}), make(chan struct{}), make(chan error, 1)
+		go func() {
+			finished <- base.Transaction(ctx, func(ctx context.Context) error {
+				if err := base.LockOccurrence(ctx, jobID, date); err != nil {
+					return err
+				}
+				close(acquired)
+				<-stop
+				return nil
+			})
+		}()
+		select {
+		case <-acquired:
+			got = true
+		case <-time.After(wait):
+		case err := <-finished:
+			t.Fatalf("lock transaction ended early: %v", err)
+		}
+		return got, func() { close(stop) }, finished
+	}
+
+	first, releaseFirst, firstDone := tryLock(ctx, job, d5, 5*time.Second)
+	if !first {
+		t.Fatal("the first transaction could not take a free lock")
+	}
+
+	t.Run("a second transaction on the same occurrence waits for the first", func(t *testing.T) {
+		got, release, done := tryLock(ctx, job, d5, 400*time.Millisecond)
+		if got {
+			release()
+			t.Fatal("the lock was granted while another transaction held it")
+		}
+		releaseFirst()
+		if err := <-firstDone; err != nil {
+			t.Fatal(err)
+		}
+		// Now the waiting transaction gets it, and finishes once released.
+		release()
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("another date, another job and another tenant are not blocked", func(t *testing.T) {
+		held, releaseHeld, heldDone := tryLock(ctx, job, d5, 5*time.Second)
+		if !held {
+			t.Fatal("could not take the lock")
+		}
+		defer func() {
+			releaseHeld()
+			<-heldDone
+		}()
+		for name, args := range map[string]struct {
+			ctx  context.Context
+			job  string
+			date time.Time
+		}{
+			"other date":   {ctx, job, d6},
+			"other job":    {ctx, "00000000-0000-0000-0000-0000000000a2", d5},
+			"other tenant": {otherCtx, job, d5},
+		} {
+			got, release, done := tryLock(args.ctx, args.job, args.date, 5*time.Second)
+			if !got {
+				t.Errorf("%s: blocked by an unrelated lock", name)
+			}
+			release()
+			<-done
+		}
+	})
+
+	t.Run("the lock is released when the transaction rolls back", func(t *testing.T) {
+		boom := errors.New("boom")
+		err := base.Transaction(ctx, func(ctx context.Context) error {
+			if err := base.LockOccurrence(ctx, job, d5); err != nil {
+				return err
+			}
+			return boom
+		})
+		if !errors.Is(err, boom) {
+			t.Fatal(err)
+		}
+		got, release, done := tryLock(ctx, job, d5, 5*time.Second)
+		if !got {
+			t.Fatal("the lock stayed held after a rollback")
+		}
+		release()
+		<-done
+	})
 }

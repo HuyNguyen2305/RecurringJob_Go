@@ -3,12 +3,14 @@ package repository
 import (
 	"context"
 	"errors"
+	"strings"
 	"time"
 
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 
 	"recurringjob/internal/common/apperror"
+	"recurringjob/internal/common/civil"
 	"recurringjob/internal/model"
 )
 
@@ -34,6 +36,9 @@ func (r *CustomerDocumentRepository) Create(ctx context.Context, doc *model.Cust
 		// The customer, location and service type are read-only: only the
 		// document and its line items are written.
 		err := tx.Omit("Customer", "Location", "ServiceType").Create(doc).Error
+		if isForeignKeyViolationOn(err, "job_id") {
+			return apperror.Conflict("the job no longer exists")
+		}
 		if isUniqueViolation(err) {
 			if r.docType == model.DocTypeInvoice {
 				return apperror.Conflict("an invoice already exists for this occurrence")
@@ -80,13 +85,35 @@ func (r *CustomerDocumentRepository) load(ctx context.Context, id string, lock b
 	return &doc, nil
 }
 
-// List returns documents newest first, optionally filtered by status.
-func (r *CustomerDocumentRepository) List(ctx context.Context, status string, limit, offset int) ([]model.CustomerDocument, error) {
+// likeEscaper makes a user's text match literally inside LIKE / ILIKE.
+var likeEscaper = strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+
+// List returns documents newest first, narrowed by the filter.
+func (r *CustomerDocumentRepository) List(ctx context.Context, f model.DocumentFilter, limit, offset int) ([]model.CustomerDocument, error) {
 	docs := []model.CustomerDocument{}
 	err := r.WithSchema(ctx, func(tx *gorm.DB) error {
 		q := tx.Where("type = ?", r.docType)
-		if status != "" {
-			q = q.Where("status = ?", status)
+		if f.Status != "" {
+			q = q.Where("status = ?", f.Status)
+		}
+		if f.CustomerID != "" {
+			q = q.Where("customer_id = ?", f.CustomerID)
+		}
+		if f.LocationID != "" {
+			q = q.Where("location_id = ?", f.LocationID)
+		}
+		if f.JobID != "" {
+			q = q.Where("job_id = ?", f.JobID)
+		}
+		if f.Q != "" {
+			like := "%" + likeEscaper.Replace(f.Q) + "%"
+			q = q.Where("(number ILIKE ? OR customer_id IN (SELECT id FROM customers WHERE name ILIKE ?))", like, like)
+		}
+		if !f.OccurrenceFrom.IsZero() {
+			q = q.Where("occurrence_date >= ?::date", civil.Format(f.OccurrenceFrom))
+		}
+		if !f.OccurrenceTo.IsZero() {
+			q = q.Where("occurrence_date <= ?::date", civil.Format(f.OccurrenceTo))
 		}
 		return q.Order("created_at DESC, id").Limit(limit).Offset(offset).
 			Preload("Customer").Preload("Location").Preload("ServiceType").
@@ -124,6 +151,19 @@ func (r *CustomerDocumentRepository) UpdateContent(ctx context.Context, id strin
 			items[i].ParentID = id
 		}
 		return tx.Create(&items).Error
+	})
+	return n, err
+}
+
+// DeleteGuarded deletes the document (its line items and revisions go with
+// it) only while its status is still one of allowedFrom, and returns the rows
+// affected; 0 means it changed under the caller.
+func (r *CustomerDocumentRepository) DeleteGuarded(ctx context.Context, id string, allowedFrom []string) (int64, error) {
+	var n int64
+	err := r.WithSchema(ctx, func(tx *gorm.DB) error {
+		res := tx.Where("id = ? AND type = ? AND status IN ?", id, r.docType, allowedFrom).Delete(&model.CustomerDocument{})
+		n = res.RowsAffected
+		return res.Error
 	})
 	return n, err
 }

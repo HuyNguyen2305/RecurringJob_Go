@@ -30,6 +30,9 @@ func (r *OccurrenceRepository) ListByJob(ctx context.Context, jobID string) ([]m
 func (r *OccurrenceRepository) Create(ctx context.Context, occ *model.JobOccurrence) error {
 	return r.WithSchema(ctx, func(tx *gorm.DB) error {
 		err := tx.Create(occ).Error
+		if isForeignKeyViolationOn(err, "job_id") {
+			return apperror.Conflict("the job no longer exists")
+		}
 		if isUniqueViolation(err) {
 			return apperror.Conflict("occurrence was changed by another request")
 		}

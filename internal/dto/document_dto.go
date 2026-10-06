@@ -67,6 +67,7 @@ type LineItemResponse struct {
 // DocumentResponse is an estimate or invoice as returned by the API.
 type DocumentResponse struct {
 	ID             string               `json:"id"`
+	Number         string               `json:"number"`
 	Type           string               `json:"type"`
 	Status         string               `json:"status"`
 	Customer       *CustomerResponse    `json:"customer"`
@@ -76,6 +77,10 @@ type DocumentResponse struct {
 	JobID          *string              `json:"jobId"`
 	JobSnapshot    *model.JobSnapshot   `json:"jobSnapshot"`
 	OccurrenceDate *string              `json:"occurrenceDate"`
+	Revision       int                  `json:"revision"`
+	SentAt         *time.Time           `json:"sentAt"`
+	PaidAt         *time.Time           `json:"paidAt"`
+	RefundedAt     *time.Time           `json:"refundedAt"`
 	LineItems      []LineItemResponse   `json:"lineItems"`
 	SubtotalCents  int64                `json:"subtotalCents"`
 	TotalCents     int64                `json:"totalCents"`
@@ -92,7 +97,8 @@ func NewDocumentResponse(d *model.CustomerDocument) DocumentResponse {
 		})
 	}
 	out := DocumentResponse{
-		ID: d.ID, Type: d.Type, Status: d.Status, Notes: d.Notes,
+		ID: d.ID, Number: d.Number, Type: d.Type, Status: d.Status, Notes: d.Notes, Revision: d.Revision,
+		SentAt: utcTime(d.SentAt), PaidAt: utcTime(d.PaidAt), RefundedAt: utcTime(d.RefundedAt),
 		JobID: d.JobID, JobSnapshot: d.JobSnapshot, OccurrenceDate: fmtDate(d.OccurrenceDate),
 		LineItems: items, SubtotalCents: d.TotalCents(), TotalCents: d.TotalCents(),
 		CreatedAt: d.CreatedAt.UTC(), UpdatedAt: d.UpdatedAt.UTC(),
@@ -117,6 +123,45 @@ func NewDocumentResponses(docs []model.CustomerDocument) []DocumentResponse {
 	out := make([]DocumentResponse, 0, len(docs))
 	for i := range docs {
 		out = append(out, NewDocumentResponse(&docs[i]))
+	}
+	return out
+}
+
+func utcTime(t *time.Time) *time.Time {
+	if t == nil {
+		return nil
+	}
+	u := t.UTC()
+	return &u
+}
+
+// RevisionResponse is what an estimate said before an edit replaced it.
+type RevisionResponse struct {
+	Revision      int                `json:"revision"`
+	Notes         string             `json:"notes"`
+	CustomerID    string             `json:"customerId"`
+	LocationID    string             `json:"locationId"`
+	ServiceTypeID string             `json:"serviceTypeId"`
+	LineItems     []LineItemResponse `json:"lineItems"`
+	TotalCents    int64              `json:"totalCents"`
+	ReplacedAt    time.Time          `json:"replacedAt"`
+}
+
+// NewRevisionResponses converts a list (never nil).
+func NewRevisionResponses(in []model.DocumentRevision) []RevisionResponse {
+	out := make([]RevisionResponse, 0, len(in))
+	for _, r := range in {
+		items := make([]LineItemResponse, 0, len(r.Content.LineItems))
+		for _, l := range r.Content.LineItems {
+			items = append(items, LineItemResponse{
+				Description: l.Description, Quantity: l.Quantity, UnitPriceCents: l.UnitPriceCents,
+				TotalCents: int64(l.Quantity) * l.UnitPriceCents,
+			})
+		}
+		out = append(out, RevisionResponse{
+			Revision: r.Revision, Notes: r.Content.Notes, CustomerID: r.Content.CustomerID, LocationID: r.Content.LocationID,
+			ServiceTypeID: r.Content.ServiceTypeID, LineItems: items, TotalCents: r.Content.TotalCents(), ReplacedAt: r.CreatedAt.UTC(),
+		})
 	}
 	return out
 }

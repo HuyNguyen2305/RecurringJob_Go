@@ -41,6 +41,10 @@ type OccurrenceRepository interface {
 	// the number of rows affected.
 	UpdateGuarded(ctx context.Context, id string, allowedFrom []string, updates map[string]any) (int64, error)
 	Transaction(ctx context.Context, fn func(ctx context.Context) error) error
+	// LockOccurrence takes the transaction-scoped lock of one occurrence, so
+	// a status change and an invoice being created for it run one after the
+	// other. It must be called inside Transaction.
+	LockOccurrence(ctx context.Context, jobID string, date time.Time) error
 }
 
 // UpdateOccurrenceRequest is the PATCH body.
@@ -49,12 +53,15 @@ type UpdateOccurrenceRequest struct {
 	RescheduledTo *time.Time
 }
 
-// InvoiceVoider handles the invoices of an occurrence that is canceled or
-// terminated. InvoiceService satisfies it.
-type InvoiceVoider interface {
+// OccurrenceInvoices handles the invoices of an occurrence that is canceled,
+// terminated or rescheduled. InvoiceService satisfies it.
+type OccurrenceInvoices interface {
 	// VoidUnpaidForOccurrence voids the draft and sent invoices and returns
 	// how many it voided.
 	VoidUnpaidForOccurrence(ctx context.Context, jobID string, date time.Time) (int64, error)
+	// MoveUnpaidForOccurrence moves the draft and sent invoices from one
+	// occurrence date to another and returns how many it moved.
+	MoveUnpaidForOccurrence(ctx context.Context, jobID string, from, to time.Time) (int64, error)
 	// PaidIDsForOccurrence returns the paid invoices, which stay as they are.
 	PaidIDsForOccurrence(ctx context.Context, jobID string, date time.Time) ([]string, error)
 }
@@ -63,7 +70,8 @@ type OccurrenceService struct {
 	jobs     JobGetter
 	occs     OccurrenceRepository
 	resolver *OccurrenceResolver
-	invoices InvoiceVoider
+	invoices OccurrenceInvoices
+	today    TodayProvider
 	now      func() time.Time
 }
 
@@ -77,10 +85,16 @@ func (s *OccurrenceService) WithClock(now func() time.Time) *OccurrenceService {
 	return s
 }
 
+// WithToday makes "today" the tenant's calendar date instead of the UTC one.
+func (s *OccurrenceService) WithToday(t TodayProvider) *OccurrenceService {
+	s.today = t
+	return s
+}
+
 // WithInvoices makes canceling or terminating an occurrence void its unpaid
-// invoices. It is set after construction because the invoice service itself
+// invoices and rescheduling it move them to the new date. It is set after construction because the invoice service itself
 // depends on this one. Without it invoices are not touched.
-func (s *OccurrenceService) WithInvoices(invoices InvoiceVoider) *OccurrenceService {
+func (s *OccurrenceService) WithInvoices(invoices OccurrenceInvoices) *OccurrenceService {
 	s.invoices = invoices
 	return s
 }
@@ -120,7 +134,11 @@ func (s *OccurrenceService) locate(ctx context.Context, job *model.Job, rows map
 	if err != nil {
 		return nil, err
 	}
-	items, _ := WalkSchedule(upTo, rows, job.Status, jobDate, civil.Truncate(s.now()))
+	today, err := currentDate(ctx, s.today, s.now)
+	if err != nil {
+		return nil, err
+	}
+	items, _ := WalkSchedule(upTo, rows, job.Status, jobDate, today)
 	for _, it := range items {
 		if it.Date == ds {
 			view.available = it.State == StateReal || it.State == StateOverdue
@@ -204,7 +222,10 @@ func (s *OccurrenceService) UpdateOccurrence(ctx context.Context, jobID string, 
 		return nil, apperror.Conflict("cannot change an occurrence from " + view.status + " to " + req.Status)
 	}
 
-	today := civil.Truncate(s.now())
+	today, err := currentDate(ctx, s.today, s.now)
+	if err != nil {
+		return nil, err
+	}
 	if req.Status == StatusCompleted && date.After(today) {
 		return nil, apperror.Validation("a future occurrence cannot be completed")
 	}
@@ -243,6 +264,12 @@ func (s *OccurrenceService) UpdateOccurrence(ctx context.Context, jobID string, 
 	}
 
 	err = s.occs.Transaction(ctx, func(ctx context.Context) error {
+		// An invoice being created for this occurrence waits for this
+		// change (and then sees it), or this change waits for the invoice
+		// (and then voids or moves it).
+		if err := s.occs.LockOccurrence(ctx, jobID, date); err != nil {
+			return err
+		}
 		if view.row != nil {
 			n, err := s.occs.UpdateGuarded(ctx, view.row.ID, AllowedFrom(req.Status), updates)
 			if err != nil {
@@ -265,9 +292,23 @@ func (s *OccurrenceService) UpdateOccurrence(ctx context.Context, jobID string, 
 			saved.PaidInvoiceIDs = paid
 		}
 		if req.Status == StatusRescheduled {
-			return s.occs.Create(ctx, &model.JobOccurrence{
+			if err := s.occs.Create(ctx, &model.JobOccurrence{
 				JobID: jobID, OccurrenceDate: to, Status: StatusUnconfirmed, RescheduledFrom: &date,
-			})
+			}); err != nil {
+				return err
+			}
+			// Draft and sent invoices follow the visit; a paid one stays on
+			// the old date and is reported.
+			if s.invoices != nil {
+				if _, err := s.invoices.MoveUnpaidForOccurrence(ctx, jobID, date, to); err != nil {
+					return err
+				}
+				paid, err := s.invoices.PaidIDsForOccurrence(ctx, jobID, date)
+				if err != nil {
+					return err
+				}
+				saved.PaidInvoiceIDs = paid
+			}
 		}
 		return nil
 	})
@@ -352,7 +393,10 @@ func (s *OccurrenceService) Schedule(ctx context.Context, jobID string, q Schedu
 	if err != nil {
 		return nil, err
 	}
-	today := civil.Truncate(s.now())
+	today, err := currentDate(ctx, s.today, s.now)
+	if err != nil {
+		return nil, err
+	}
 	jobDate := civil.Truncate(job.Date)
 	horizon := ScheduleHorizon(jobDate)
 

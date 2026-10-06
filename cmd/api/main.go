@@ -3,6 +3,7 @@ package main
 
 import (
 	"log"
+	_ "time/tzdata" // IANA zone names must load on hosts without a zone database
 
 	"github.com/joho/godotenv"
 	"gorm.io/driver/postgres"

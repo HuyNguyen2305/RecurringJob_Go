@@ -23,20 +23,23 @@ func NewServer(db *gorm.DB, defaultSchema string) *gin.Engine {
 	occRepo := repository.NewOccurrenceRepository(db)
 	estimateRepo := repository.NewEstimateRepository(db)
 	invoiceRepo := repository.NewInvoiceRepository(db)
+	settingsRepo := repository.NewSettingsRepository(db)
 
 	refs := service.NewReferences(customerRepo, locationRepo, serviceTypeRepo)
 	customerSvc := service.NewCustomerService(customerRepo, locationRepo)
 	serviceTypeSvc := service.NewServiceTypeService(serviceTypeRepo)
+	settingsSvc := service.NewSettingsService(settingsRepo)
 	resolver := service.NewOccurrenceResolver(jobRepo)
 	jobSvc := service.NewJobService(jobRepo, resolver, refs)
-	occSvc := service.NewOccurrenceService(jobRepo, occRepo, resolver)
+	occSvc := service.NewOccurrenceService(jobRepo, occRepo, resolver).WithToday(settingsSvc)
 	invoiceSvc := service.NewInvoiceService(invoiceRepo, jobRepo, occSvc)
-	estimateSvc := service.NewEstimateService(estimateRepo, jobSvc, refs).WithInvoices(invoiceSvc)
+	estimateSvc := service.NewEstimateService(estimateRepo, jobSvc, refs).WithToday(settingsSvc).WithInvoices(invoiceSvc).WithReopen(jobRepo, occRepo, invoiceSvc)
 	// The invoice service needs the occurrence service (availability) and the
 	// occurrence service needs the invoice service (voiding), so one is set late.
 	occSvc.WithInvoices(invoiceSvc)
 
 	return router.New(defaultSchema, router.Handlers{
+		Settings:     handler.NewSettingsHandler(settingsSvc),
 		Customers:    handler.NewCustomerHandler(customerSvc),
 		ServiceTypes: handler.NewServiceTypeHandler(serviceTypeSvc),
 		Jobs:         handler.NewJobHandler(jobSvc),

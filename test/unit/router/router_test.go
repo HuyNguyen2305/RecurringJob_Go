@@ -74,6 +74,7 @@ func (stubInvoices) Create(context.Context, string, time.Time, service.DocumentI
 
 func handlers(jobs handler.JobService) router.Handlers {
 	return router.Handlers{
+		Settings:     handler.NewSettingsHandler(stubSettings{}),
 		Customers:    handler.NewCustomerHandler(stubCustomers{}),
 		ServiceTypes: handler.NewServiceTypeHandler(stubTypes{}),
 		Jobs:         handler.NewJobHandler(jobs),
@@ -102,8 +103,14 @@ func TestRoutes(t *testing.T) {
 		"GET /customers/:id/locations",
 		"GET /estimates",
 		"GET /estimates/:id",
+		"GET /estimates/:id/revisions",
+		"DELETE /estimates/:id",
+		"DELETE /invoices/:id",
+		"POST /estimates/:id/reopen",
 		"GET /invoices",
 		"GET /service-types",
+		"GET /settings",
+		"PUT /settings",
 		"GET /invoices/:id",
 		"GET /jobs/:id/occurrences",
 		"GET /jobs/:id/schedule",
@@ -259,6 +266,18 @@ func (stubCustomers) ListLocations(context.Context, string) ([]model.Location, e
 	return nil, nil
 }
 
+type stubSettings struct{}
+
+func (stubSettings) Get(context.Context) (*model.TenantSettings, error) {
+	return &model.TenantSettings{ID: 1, Timezone: "UTC"}, nil
+}
+
+func (stubSettings) UpdateTimezone(_ context.Context, tz string) (*model.TenantSettings, error) {
+	return &model.TenantSettings{ID: 1, Timezone: tz}, nil
+}
+
+func (stubSettings) TodayFor(string) time.Time { return time.Time{} }
+
 type stubTypes struct{}
 
 func (stubTypes) CreateServiceType(context.Context, service.ServiceTypeInput) (*model.ServiceType, error) {
@@ -266,3 +285,11 @@ func (stubTypes) CreateServiceType(context.Context, service.ServiceTypeInput) (*
 }
 
 func (stubTypes) ListServiceTypes(context.Context) ([]model.ServiceType, error) { return nil, nil }
+
+func (stubDocs) Delete(context.Context, string) error { return nil }
+
+func (stubDocs) Reopen(context.Context, string) (*model.CustomerDocument, error) { return stubDoc, nil }
+
+func (stubDocs) Revisions(context.Context, string) ([]model.DocumentRevision, error) {
+	return nil, nil
+}

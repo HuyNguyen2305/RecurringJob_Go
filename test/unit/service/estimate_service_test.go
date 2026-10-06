@@ -3,6 +3,7 @@ package service_test
 import (
 	"context"
 	"errors"
+	"reflect"
 	"testing"
 	"time"
 
@@ -368,6 +369,30 @@ func TestEstimateUpdate(t *testing.T) {
 		}
 	})
 
+	t.Run("a recurring job's estimate is never closed by a paid invoice", func(t *testing.T) {
+		store := newMemDocs()
+		d := putEstimate(store, "approved")
+		d.JobSnapshot = &model.JobSnapshot{ID: jobID, Recurrence: &recurrence.Rule{Frequency: "weekly", WeeklyPeriod: "every", WeeklyDaysOfWeek: []int{1}}}
+		paid := &fakePaid{paid: true}
+		got, err := newEstimateService(store, &fakeJobCreator{}).WithInvoices(paid).Update(ctx, d.ID, service.DocumentPatch{Notes: str("still editable")})
+		if err != nil || got.Notes != "still editable" {
+			t.Fatalf("err=%v got=%+v", err, got)
+		}
+		if len(paid.asked) != 0 {
+			t.Fatalf("a recurring estimate needs no paid check, asked %v", paid.asked)
+		}
+	})
+
+	t.Run("a one-off job's estimate is closed once its invoice is paid", func(t *testing.T) {
+		store := newMemDocs()
+		d := putEstimate(store, "approved")
+		d.JobSnapshot = &model.JobSnapshot{ID: jobID} // no recurrence
+		_, err := newEstimateService(store, &fakeJobCreator{}).WithInvoices(&fakePaid{paid: true}).Update(ctx, d.ID, service.DocumentPatch{Notes: str("late")})
+		if statusOf(t, err) != 409 {
+			t.Fatalf("got %v", err)
+		}
+	})
+
 	t.Run("an estimate with no job yet is never checked against invoices", func(t *testing.T) {
 		store := newMemDocs()
 		d := store.put("sent", oneItem())
@@ -454,4 +479,301 @@ func TestApproveRunsOnTheLockedRow(t *testing.T) {
 	if store.locked != 1 || store.transacted != 1 {
 		t.Fatalf("locked=%d transacted=%d", store.locked, store.transacted)
 	}
+}
+
+type fakeToday struct {
+	day time.Time
+	err error
+}
+
+func (f fakeToday) Today(context.Context) (time.Time, error) { return f.day, f.err }
+
+func TestEstimateApproveUsesTheTenantsToday(t *testing.T) {
+	ctx := context.Background()
+	// The clock says it is 2026-10-05 in UTC; the tenant's calendar disagrees.
+	approve := func(today fakeToday, date string) error {
+		store := newMemDocs()
+		d := store.put("sent", oneItem())
+		s := newEstimateService(store, &fakeJobCreator{}).WithToday(today)
+		_, err := s.Approve(ctx, d.ID, service.ApproveEstimateInput{StartTime: "09:00", LengthMinutes: 60, Date: dt(date)})
+		return err
+	}
+	// UTC+14: already the 6th, so the 5th is yesterday there.
+	ahead := fakeToday{day: dt("2026-10-06")}
+	if got := statusOf(t, approve(ahead, "2026-10-05")); got != 400 {
+		t.Errorf("UTC today but local yesterday: status %d, want 400", got)
+	}
+	if err := approve(ahead, "2026-10-06"); err != nil {
+		t.Errorf("local today: %v", err)
+	}
+	// UTC-8: still the 4th, so the 4th is allowed although UTC is on the 5th.
+	behind := fakeToday{day: dt("2026-10-04")}
+	if err := approve(behind, "2026-10-04"); err != nil {
+		t.Errorf("local today behind UTC: %v", err)
+	}
+	if got := statusOf(t, approve(behind, "2026-10-03")); got != 400 {
+		t.Errorf("local yesterday behind UTC: status %d, want 400", got)
+	}
+	boom := errors.New("boom")
+	if err := approve(fakeToday{err: boom}, "2026-10-12"); !errors.Is(err, boom) {
+		t.Errorf("provider failure: %v", err)
+	}
+}
+
+// fakeJobRemover records the job lock and delete, in order, next to the
+// estimate store's own events.
+type fakeJobRemover struct {
+	events    *[]string
+	lockErr   error
+	deleteErr error
+	locked    []string
+	deleted   []string
+}
+
+func (f *fakeJobRemover) LockJob(_ context.Context, id string) error {
+	*f.events = append(*f.events, "lock-job")
+	f.locked = append(f.locked, id)
+	return f.lockErr
+}
+
+func (f *fakeJobRemover) Delete(_ context.Context, id string) error {
+	*f.events = append(*f.events, "delete-job")
+	f.deleted = append(f.deleted, id)
+	return f.deleteErr
+}
+
+type fakeOccRows struct {
+	rows []model.JobOccurrence
+	err  error
+}
+
+func (f fakeOccRows) ListByJob(context.Context, string) ([]model.JobOccurrence, error) {
+	return f.rows, f.err
+}
+
+func TestEstimateEditsKeepRevisions(t *testing.T) {
+	ctx := context.Background()
+	str := func(s string) *string { return &s }
+	approved := func(store *memDocs) *model.CustomerDocument {
+		d := store.put("approved", oneItem())
+		jobID := uid("j1")
+		d.JobID = &jobID
+		d.Notes = "v1"
+		return d
+	}
+
+	t.Run("editing a sent estimate keeps what it said and moves the counter", func(t *testing.T) {
+		store := newMemDocs()
+		d := store.put("sent", oneItem())
+		d.Notes = "original"
+		items := []service.LineItemInput{{Description: "New", Quantity: 3, UnitPriceCents: 100}}
+		if _, err := newEstimateService(store, &fakeJobCreator{}).Update(ctx, d.ID, service.DocumentPatch{Notes: str("changed"), LineItems: &items}); err != nil {
+			t.Fatal(err)
+		}
+		if len(store.revisions) != 1 {
+			t.Fatalf("revisions %+v", store.revisions)
+		}
+		rev := store.revisions[0]
+		want := model.RevisionContent{
+			Notes: "original", CustomerID: refCustomer, LocationID: refLocation, ServiceTypeID: refService,
+			LineItems: []model.RevisionLine{{Description: "Clean", Quantity: 2, UnitPriceCents: 500}},
+		}
+		if rev.DocumentID != d.ID || rev.Revision != 1 || !reflect.DeepEqual(rev.Content, want) {
+			t.Fatalf("revision %+v, want content %+v", rev, want)
+		}
+		if d.Revision != 2 || d.Notes != "changed" {
+			t.Fatalf("doc revision=%d notes=%q", d.Revision, d.Notes)
+		}
+	})
+
+	t.Run("each edit of an approved estimate adds a revision, newest first", func(t *testing.T) {
+		store := newMemDocs()
+		d := approved(store)
+		s := newEstimateService(store, &fakeJobCreator{})
+		for _, n := range []string{"v2", "v3"} {
+			if _, err := s.Update(ctx, d.ID, service.DocumentPatch{Notes: str(n)}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		got, err := s.Revisions(ctx, d.ID)
+		if err != nil || len(got) != 2 || got[0].Revision != 2 || got[0].Content.Notes != "v2" || got[1].Revision != 1 || got[1].Content.Notes != "v1" {
+			t.Fatalf("revisions %+v err=%v", got, err)
+		}
+		if d.Revision != 3 {
+			t.Fatalf("revision counter %d, want 3", d.Revision)
+		}
+	})
+
+	t.Run("a draft was never shown, so editing it leaves no trace", func(t *testing.T) {
+		store := newMemDocs()
+		d := store.put("draft", oneItem())
+		if _, err := newEstimateService(store, &fakeJobCreator{}).Update(ctx, d.ID, service.DocumentPatch{Notes: str("x")}); err != nil {
+			t.Fatal(err)
+		}
+		if len(store.revisions) != 0 || d.Revision != 1 {
+			t.Fatalf("revisions=%v revision=%d", store.revisions, d.Revision)
+		}
+	})
+
+	t.Run("a refused edit keeps nothing", func(t *testing.T) {
+		store := newMemDocs()
+		d := approved(store)
+		_, err := newEstimateService(store, &fakeJobCreator{}).WithInvoices(&fakePaid{paid: true}).Update(ctx, d.ID, service.DocumentPatch{Notes: str("late")})
+		if statusOf(t, err) != 409 || len(store.revisions) != 0 || d.Revision != 1 {
+			t.Fatalf("err=%v revisions=%v revision=%d", err, store.revisions, d.Revision)
+		}
+		// A closed estimate (declined) is refused before anything is read.
+		declined := store.put("declined", oneItem())
+		if _, err := newEstimateService(store, &fakeJobCreator{}).Update(ctx, declined.ID, service.DocumentPatch{Notes: str("x")}); statusOf(t, err) != 409 || len(store.revisions) != 0 {
+			t.Fatalf("declined: err=%v revisions=%v", err, store.revisions)
+		}
+	})
+
+	t.Run("a failure to keep the revision stops the edit", func(t *testing.T) {
+		store := newMemDocs()
+		d := approved(store)
+		store.revisionErr = errors.New("db down")
+		if _, err := newEstimateService(store, &fakeJobCreator{}).Update(ctx, d.ID, service.DocumentPatch{Notes: str("x")}); !errors.Is(err, store.revisionErr) {
+			t.Fatalf("got %v", err)
+		}
+		if d.Notes != "v1" || d.Revision != 1 {
+			t.Fatalf("the estimate changed: notes=%q revision=%d", d.Notes, d.Revision)
+		}
+	})
+
+	t.Run("Revisions: never nil, 400 for a bad id, 404 for an unknown estimate", func(t *testing.T) {
+		store := newMemDocs()
+		d := store.put("sent", oneItem())
+		s := newEstimateService(store, &fakeJobCreator{})
+		if got, err := s.Revisions(ctx, d.ID); err != nil || got == nil || len(got) != 0 {
+			t.Fatalf("got %#v err=%v", got, err)
+		}
+		if _, err := s.Revisions(ctx, "nope"); statusOf(t, err) != 400 {
+			t.Fatalf("malformed: %v", err)
+		}
+		if _, err := s.Revisions(ctx, uid("ff")); statusOf(t, err) != 404 {
+			t.Fatalf("unknown: %v", err)
+		}
+	})
+}
+
+func TestEstimateReopen(t *testing.T) {
+	ctx := context.Background()
+	approved := func(store *memDocs) *model.CustomerDocument {
+		d := store.put("approved", oneItem())
+		jobID := uid("j1")
+		d.JobID = &jobID
+		d.JobSnapshot = &model.JobSnapshot{ID: jobID}
+		return d
+	}
+	// setup wires an estimate service whose job lock/delete and checks are fakes.
+	setup := func(store *memDocs, occs fakeOccRows) (*service.EstimateService, *fakeJobRemover) {
+		jobs := &fakeJobRemover{events: &store.events}
+		return newEstimateService(store, &fakeJobCreator{}).WithReopen(jobs, occs, store), jobs
+	}
+
+	t.Run("undoes a fresh approval: the job is gone and the estimate is sent again", func(t *testing.T) {
+		store := newMemDocs()
+		d := approved(store)
+		s, jobs := setup(store, fakeOccRows{})
+		got, err := s.Reopen(ctx, d.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.Status != "sent" || got.JobID != nil || got.JobSnapshot != nil {
+			t.Fatalf("estimate %+v", got)
+		}
+		if !reflect.DeepEqual(jobs.deleted, []string{uid("j1")}) || store.transacted != 1 || store.locked != 1 {
+			t.Fatalf("deleted=%v transacted=%d locked=%d", jobs.deleted, store.transacted, store.locked)
+		}
+		if want := []string{"begin", "lock-job", "reopen", "delete-job"}; !reflect.DeepEqual(store.events, want) {
+			t.Fatalf("order %v, want %v (the job is locked before it is judged, and deleted only after the estimate let go of it)", store.events, want)
+		}
+		if !reflect.DeepEqual(store.lastAllowed, []string{"approved"}) {
+			t.Fatalf("guard %v", store.lastAllowed)
+		}
+	})
+
+	t.Run("refusals change nothing", func(t *testing.T) {
+		tests := []struct {
+			name  string
+			setup func(*memDocs) (id string, occs fakeOccRows)
+			want  int
+		}{
+			{"a draft", func(s *memDocs) (string, fakeOccRows) { return s.put("draft", oneItem()).ID, fakeOccRows{} }, 409},
+			{"a sent estimate", func(s *memDocs) (string, fakeOccRows) { return s.put("sent", oneItem()).ID, fakeOccRows{} }, 409},
+			{"a declined estimate", func(s *memDocs) (string, fakeOccRows) { return s.put("declined", oneItem()).ID, fakeOccRows{} }, 409},
+			{"an occurrence was changed", func(s *memDocs) (string, fakeOccRows) {
+				return approved(s).ID, fakeOccRows{rows: []model.JobOccurrence{{Status: "confirmed"}}}
+			}, 409},
+			{"an invoice exists (any status)", func(s *memDocs) (string, fakeOccRows) {
+				s.countN = 1
+				return approved(s).ID, fakeOccRows{}
+			}, 409},
+			{"unknown estimate", func(*memDocs) (string, fakeOccRows) { return uid("ff"), fakeOccRows{} }, 404},
+			{"malformed id", func(*memDocs) (string, fakeOccRows) { return "nope", fakeOccRows{} }, 400},
+		}
+		for _, tt := range tests {
+			store := newMemDocs()
+			id, occs := tt.setup(store)
+			s, jobs := setup(store, occs)
+			if _, err := s.Reopen(ctx, id); statusOf(t, err) != tt.want {
+				t.Errorf("%s: %v", tt.name, err)
+			}
+			if len(jobs.deleted) != 0 || len(store.reopened) != 0 {
+				t.Errorf("%s: something changed (deleted=%v reopened=%v)", tt.name, jobs.deleted, store.reopened)
+			}
+		}
+	})
+
+	t.Run("store errors come back as is and nothing is deleted", func(t *testing.T) {
+		boom := errors.New("db down")
+		tests := map[string]func(*memDocs, *fakeJobRemover) fakeOccRows{
+			"lock fails":        func(_ *memDocs, j *fakeJobRemover) fakeOccRows { j.lockErr = boom; return fakeOccRows{} },
+			"occurrence lookup": func(*memDocs, *fakeJobRemover) fakeOccRows { return fakeOccRows{err: boom} },
+			"invoice count":     func(s *memDocs, _ *fakeJobRemover) fakeOccRows { s.occErr = boom; return fakeOccRows{} },
+			"estimate update":   func(s *memDocs, _ *fakeJobRemover) fakeOccRows { s.updateErr = boom; return fakeOccRows{} },
+		}
+		for name, arrange := range tests {
+			store := newMemDocs()
+			d := approved(store)
+			jobs := &fakeJobRemover{events: &store.events}
+			occs := arrange(store, jobs)
+			s := newEstimateService(store, &fakeJobCreator{}).WithReopen(jobs, occs, store)
+			if _, err := s.Reopen(ctx, d.ID); !errors.Is(err, boom) {
+				t.Errorf("%s: %v", name, err)
+			}
+			if len(jobs.deleted) != 0 {
+				t.Errorf("%s: the job was deleted", name)
+			}
+		}
+	})
+
+	t.Run("a failure while deleting the job comes back as is", func(t *testing.T) {
+		store := newMemDocs()
+		d := approved(store)
+		s, jobs := setup(store, fakeOccRows{})
+		jobs.deleteErr = errors.New("fk")
+		if _, err := s.Reopen(ctx, d.ID); !errors.Is(err, jobs.deleteErr) {
+			t.Fatalf("got %v", err)
+		}
+	})
+
+	t.Run("losing the race to another change is a 409", func(t *testing.T) {
+		store := newMemDocs()
+		d := approved(store)
+		store.zeroRows = true
+		s, jobs := setup(store, fakeOccRows{})
+		if _, err := s.Reopen(ctx, d.ID); statusOf(t, err) != 409 || len(jobs.deleted) != 0 {
+			t.Fatalf("err=%v deleted=%v", err, jobs.deleted)
+		}
+	})
+
+	t.Run("without the wiring it fails instead of guessing", func(t *testing.T) {
+		store := newMemDocs()
+		d := approved(store)
+		if _, err := newEstimateService(store, &fakeJobCreator{}).Reopen(ctx, d.ID); err == nil {
+			t.Fatal("expected an error")
+		}
+	})
 }

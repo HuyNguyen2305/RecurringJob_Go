@@ -3,6 +3,7 @@ package service_test
 import (
 	"context"
 	"errors"
+	"reflect"
 	"testing"
 	"time"
 
@@ -15,13 +16,17 @@ import (
 func recurrenceDaily() recurrence.Rule { return recurrence.Rule{Frequency: "daily"} }
 
 type fakeAvailability struct {
-	jobID string
-	date  time.Time
-	err   error
+	events *[]string // when set, the check is recorded here
+	jobID  string
+	date   time.Time
+	err    error
 }
 
 func (f *fakeAvailability) AvailableFor(_ context.Context, jobID string, date time.Time) error {
 	f.jobID, f.date = jobID, date
+	if f.events != nil {
+		*f.events = append(*f.events, "available")
+	}
 	return f.err
 }
 
@@ -172,4 +177,81 @@ func withRefs(j *model.Job) *model.Job {
 	j.Location = &model.Location{ID: refLocation, CustomerID: refCustomer, AddressLine1: "1 Main Street"}
 	j.ServiceType = &model.ServiceType{ID: refService, Name: "Window cleaning"}
 	return j
+}
+
+func TestInvoiceCreateIsOneLockedStepPerOccurrence(t *testing.T) {
+	ctx := context.Background()
+	jobID := uid("a2")
+	in := service.DocumentInput{LineItems: []service.LineItemInput{{Description: "Clean", Quantity: 1, UnitPriceCents: 900}}}
+	job := func() mockJobs { return mockJobs{jobID: withRefs(recJob(jobID, "2026-10-02", recurrenceDaily()))} }
+
+	t.Run("the lock comes first, then the availability check, then the insert, all in one transaction", func(t *testing.T) {
+		store := newMemDocs()
+		occs := &fakeAvailability{events: &store.events}
+		s := service.NewInvoiceService(store, job(), occs)
+		if _, err := s.Create(ctx, jobID, dt("2026-10-05"), in); err != nil {
+			t.Fatal(err)
+		}
+		want := []string{"begin", "lock:" + jobID + ":2026-10-05", "available", "create"}
+		if !reflect.DeepEqual(store.events, want) || store.transacted != 1 {
+			t.Fatalf("events %v transactions %d, want %v in 1", store.events, store.transacted, want)
+		}
+	})
+
+	t.Run("a lock failure stops everything", func(t *testing.T) {
+		boom := errors.New("lock timeout")
+		store := newMemDocs()
+		store.lockErr = boom
+		occs := &fakeAvailability{events: &store.events}
+		s := service.NewInvoiceService(store, job(), occs)
+		if _, err := s.Create(ctx, jobID, dt("2026-10-05"), in); !errors.Is(err, boom) {
+			t.Fatalf("got %v", err)
+		}
+		if len(store.docs) != 0 || occs.jobID != "" {
+			t.Fatal("something ran although the lock failed")
+		}
+	})
+
+	t.Run("invalid input never opens a transaction", func(t *testing.T) {
+		store := newMemDocs()
+		s := service.NewInvoiceService(store, job(), &fakeAvailability{})
+		bad := service.DocumentInput{LineItems: []service.LineItemInput{{Description: "x", Quantity: 0}}}
+		if _, err := s.Create(ctx, jobID, dt("2026-10-05"), bad); statusOf(t, err) != 400 || store.transacted != 0 {
+			t.Fatalf("err=%v transactions=%d", err, store.transacted)
+		}
+	})
+}
+
+func TestInvoiceMoveUnpaidForOccurrence(t *testing.T) {
+	ctx := context.Background()
+	jobID := uid("a3")
+	store := newMemDocs()
+	store.movedN = 2
+	s := service.NewInvoiceService(store, mockJobs{}, &fakeAvailability{})
+	local := time.Date(2026, 10, 5, 23, 0, 0, 0, time.FixedZone("-8", -8*3600))
+	n, err := s.MoveUnpaidForOccurrence(ctx, jobID, local, time.Date(2026, 10, 9, 3, 0, 0, 0, time.UTC))
+	if err != nil || n != 2 {
+		t.Fatalf("n=%d err=%v", n, err)
+	}
+	if len(store.moveCalls) != 1 || store.moveCalls[0].jobID != jobID || !store.moveCalls[0].from.Equal(dt("2026-10-06")) || !store.moveCalls[0].to.Equal(dt("2026-10-09")) {
+		t.Fatalf("calls %+v", store.moveCalls)
+	}
+	store.occErr = errors.New("db down")
+	if _, err := s.MoveUnpaidForOccurrence(ctx, jobID, dt("2026-10-05"), dt("2026-10-06")); !errors.Is(err, store.occErr) {
+		t.Fatalf("got %v", err)
+	}
+}
+
+func TestInvoiceCountForJob(t *testing.T) {
+	ctx := context.Background()
+	store := newMemDocs()
+	store.countN = 3
+	s := service.NewInvoiceService(store, mockJobs{}, &fakeAvailability{})
+	if n, err := s.CountForJob(ctx, uid("a1")); err != nil || n != 3 {
+		t.Fatalf("n=%d err=%v", n, err)
+	}
+	store.occErr = errors.New("db down")
+	if _, err := s.CountForJob(ctx, uid("a1")); !errors.Is(err, store.occErr) {
+		t.Fatalf("got %v", err)
+	}
 }

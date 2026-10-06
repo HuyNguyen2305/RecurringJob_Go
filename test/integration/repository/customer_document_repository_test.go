@@ -104,13 +104,13 @@ func TestEstimateRepository(t *testing.T) {
 		if _, err := invoices.Get(ctx, est.ID); appStatus(t, err) != 404 {
 			t.Errorf("invoice repo returned an estimate: %v", err)
 		}
-		estList, _ := estimates.List(ctx, "", 100, 0)
+		estList, _ := estimates.List(ctx, model.DocumentFilter{}, 100, 0)
 		for _, d := range estList {
 			if d.Type != "estimate" || d.ID == inv.ID {
 				t.Errorf("estimate list leaked %+v", d)
 			}
 		}
-		invList, _ := invoices.List(ctx, "", 100, 0)
+		invList, _ := invoices.List(ctx, model.DocumentFilter{}, 100, 0)
 		if len(invList) != 1 || invList[0].ID != inv.ID {
 			t.Errorf("invoice list %+v", invList)
 		}
@@ -137,7 +137,7 @@ func TestCustomerDocumentList(t *testing.T) {
 
 	names := func(status string, limit, offset int) string {
 		t.Helper()
-		docs, err := estimates.List(ctx, status, limit, offset)
+		docs, err := estimates.List(ctx, model.DocumentFilter{Status: status}, limit, offset)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -162,7 +162,7 @@ func TestCustomerDocumentList(t *testing.T) {
 	if got := names("approved", 10, 0); got != "" {
 		t.Errorf("no match: %q", got)
 	}
-	if docs, err := estimates.List(ctx, "", 10, 0); err != nil || docs == nil {
+	if docs, err := estimates.List(ctx, model.DocumentFilter{}, 10, 0); err != nil || docs == nil {
 		t.Errorf("list must be a non-nil slice: %v %v", docs, err)
 	}
 }
@@ -358,7 +358,7 @@ func TestCustomerDocumentConstraints(t *testing.T) {
 		name, sql, constraint string
 	}{
 		{"unknown type", `INSERT INTO customer_documents (type, status, customer_id, location_id, service_type_id) VALUES ('quote', 'draft', ` + refVals + `)`, "violates check constraint"}, // which CHECK fires first is up to Postgres
-		{"estimate with an invoice status", `INSERT INTO customer_documents (type, status, customer_id, location_id, service_type_id) VALUES ('estimate', 'paid', ` + refVals + `)`, "customer_documents_status_per_type"},
+		{"estimate with an invoice status", `INSERT INTO customer_documents (type, status, customer_id, location_id, service_type_id, paid_at) VALUES ('estimate', 'paid', ` + refVals + `, now())`, "customer_documents_status_per_type"},
 		{"invoice with an estimate status", `INSERT INTO customer_documents (type, status, customer_id, location_id, service_type_id, job_id, job_snapshot, occurrence_date) VALUES ('invoice', 'approved', ` + refVals + `, '` + job.ID + `', ` + snap + `, '2026-10-02')`, "customer_documents_status_per_type"},
 		{"invoice without a job", `INSERT INTO customer_documents (type, status, customer_id, location_id, service_type_id, job_snapshot, occurrence_date) VALUES ('invoice', 'draft', ` + refVals + `, ` + snap + `, '2026-10-02')`, "customer_documents_invoice_requires_job"},
 		{"invoice without a snapshot", `INSERT INTO customer_documents (type, status, customer_id, location_id, service_type_id, job_id, occurrence_date) VALUES ('invoice', 'draft', ` + refVals + `, '` + job.ID + `', '2026-10-02')`, "customer_documents_invoice_requires_job"},
@@ -592,7 +592,7 @@ func TestInvoiceOccurrenceQueries(t *testing.T) {
 
 	t.Run("a paid invoice is not touched by the allowed statuses", func(t *testing.T) {
 		paid := invoice(job.ID, civil.New(2026, 10, 7), "sent")
-		if n, err := invoices.UpdateStatusGuarded(ctx, paid.ID, []string{"sent"}, map[string]any{"status": "paid"}); err != nil || n != 1 {
+		if n, err := invoices.UpdateStatusGuarded(ctx, paid.ID, []string{"sent"}, map[string]any{"status": "paid", "paid_at": time.Now()}); err != nil || n != 1 {
 			t.Fatal(n, err)
 		}
 		if n, err := invoices.UpdateStatusForOccurrence(ctx, job.ID, civil.New(2026, 10, 7), []string{"draft", "sent"}, "void"); err != nil || n != 0 {
@@ -685,4 +685,104 @@ func TestVoidedInvoiceFreesTheOccurrence(t *testing.T) {
 	if n := helpers.Scalar(t, ctx, db, `SELECT count(*) FROM customer_documents WHERE type = 'invoice' AND status = 'void'`); n != 2 {
 		t.Fatalf("%d void invoices, want 2", n)
 	}
+}
+
+func TestMoveUnpaidForOccurrence(t *testing.T) {
+	db, ctx := helpers.NewTestDB(t)
+	r := helpers.RefsFor(t, ctx, db)
+	invoices := repository.NewInvoiceRepository(db)
+	estimates := repository.NewEstimateRepository(db)
+	job := helpers.SeedJob(t, ctx, db, fixtures.DailyJob(civil.New(2026, 10, 1)))
+	other := helpers.SeedJob(t, ctx, db, fixtures.DailyJob(civil.New(2026, 10, 1)))
+	oct5, oct6, oct9 := civil.New(2026, 10, 5), civil.New(2026, 10, 6), civil.New(2026, 10, 9)
+
+	invoice := func(jobID string, date time.Time, status string) *model.CustomerDocument {
+		t.Helper()
+		inv := &model.CustomerDocument{
+			Status: "draft", CustomerID: r.CustomerID, LocationID: r.LocationID, ServiceTypeID: r.ServiceTypeID, LineItems: items("A"),
+			JobID: &jobID, OccurrenceDate: &date, JobSnapshot: &model.JobSnapshot{ID: jobID, Date: "2026-10-01", Status: "unconfirmed"},
+		}
+		if err := invoices.Create(ctx, inv); err != nil {
+			t.Fatal(err)
+		}
+		if status != "draft" {
+			if n, err := invoices.UpdateStatusGuarded(ctx, inv.ID, []string{"draft"}, map[string]any{"status": status}); err != nil || n != 1 {
+				t.Fatalf("set %s: n=%d err=%v", status, n, err)
+			}
+		}
+		return inv
+	}
+	dateOf := func(id string) string {
+		t.Helper()
+		got, err := invoices.Get(ctx, id)
+		if err != nil || got.OccurrenceDate == nil {
+			t.Fatalf("get %s: %+v err=%v", id, got, err)
+		}
+		return civil.Format(*got.OccurrenceDate)
+	}
+
+	draft := invoice(job.ID, oct5, "draft")
+	// One live invoice per occurrence, so the sent one is for another visit
+	// that is moved on its own below.
+	sent := invoice(job.ID, oct6, "sent")
+	otherJob := invoice(other.ID, oct5, "draft")
+	before, _ := invoices.Get(ctx, draft.ID)
+
+	t.Run("moves a draft invoice to the new date and touches updated_at", func(t *testing.T) {
+		time.Sleep(5 * time.Millisecond)
+		n, err := invoices.MoveUnpaidForOccurrence(ctx, job.ID, oct5, oct9)
+		if err != nil || n != 1 {
+			t.Fatalf("n=%d err=%v", n, err)
+		}
+		if dateOf(draft.ID) != "2026-10-09" {
+			t.Fatalf("draft is on %s", dateOf(draft.ID))
+		}
+		after, _ := invoices.Get(ctx, draft.ID)
+		if !after.UpdatedAt.After(before.UpdatedAt) {
+			t.Fatalf("updated_at %v -> %v", before.UpdatedAt, after.UpdatedAt)
+		}
+		if dateOf(sent.ID) != "2026-10-06" || dateOf(otherJob.ID) != "2026-10-05" {
+			t.Fatal("it moved an invoice of another date or another job")
+		}
+	})
+
+	t.Run("moves a sent invoice too", func(t *testing.T) {
+		if n, err := invoices.MoveUnpaidForOccurrence(ctx, job.ID, oct6, civil.New(2026, 10, 10)); err != nil || n != 1 {
+			t.Fatalf("n=%d err=%v", n, err)
+		}
+		if dateOf(sent.ID) != "2026-10-10" {
+			t.Fatalf("sent is on %s", dateOf(sent.ID))
+		}
+	})
+
+	t.Run("paid and void invoices stay where they are", func(t *testing.T) {
+		oct12 := civil.New(2026, 10, 12)
+		voided := invoice(job.ID, oct12, "void") // a void invoice frees the slot for the paid one
+		paid := invoice(job.ID, oct12, "sent")
+		if n, err := invoices.UpdateStatusGuarded(ctx, paid.ID, []string{"sent"}, map[string]any{"status": "paid", "paid_at": time.Now()}); err != nil || n != 1 {
+			t.Fatal(n, err)
+		}
+		if n, err := invoices.MoveUnpaidForOccurrence(ctx, job.ID, oct12, civil.New(2026, 10, 20)); err != nil || n != 0 {
+			t.Fatalf("n=%d err=%v", n, err)
+		}
+		if dateOf(paid.ID) != "2026-10-12" || dateOf(voided.ID) != "2026-10-12" {
+			t.Fatal("a paid or void invoice moved")
+		}
+	})
+
+	t.Run("nothing to move is zero rows, not an error", func(t *testing.T) {
+		if n, err := invoices.MoveUnpaidForOccurrence(ctx, job.ID, civil.New(2026, 11, 1), oct9); err != nil || n != 0 {
+			t.Fatalf("n=%d err=%v", n, err)
+		}
+	})
+
+	t.Run("an estimate is never moved", func(t *testing.T) {
+		est := &model.CustomerDocument{Status: "draft", CustomerID: r.CustomerID, LocationID: r.LocationID, ServiceTypeID: r.ServiceTypeID, LineItems: items("A")}
+		if err := estimates.Create(ctx, est); err != nil {
+			t.Fatal(err)
+		}
+		if n := helpers.Scalar(t, ctx, db, `SELECT count(*) FROM customer_documents WHERE type = 'estimate' AND occurrence_date IS NOT NULL`); n != 0 {
+			t.Fatalf("%d estimates have an occurrence date", n)
+		}
+	})
 }
