@@ -18,6 +18,7 @@ type Handlers struct {
 	Occurrences  *handler.OccurrenceHandler
 	Estimates    *handler.EstimateHandler
 	Invoices     *handler.InvoiceHandler
+	WorkOrders   *handler.WorkOrderHandler
 }
 
 // New builds the Gin engine with the error and tenant middlewares and the
@@ -47,6 +48,7 @@ func New(defaultSchema string, h Handlers) *gin.Engine {
 	g.GET("/:id/schedule", h.Occurrences.Schedule)
 	g.PATCH("/:id/occurrences/:date", h.Occurrences.Update)
 	g.POST("/:id/occurrences/:date/invoice", h.Invoices.Create)
+	g.POST("/:id/occurrences/:date/work-order", h.WorkOrders.Create)
 
 	e := r.Group("/estimates")
 	e.POST("", h.Estimates.Create)
@@ -65,5 +67,12 @@ func New(defaultSchema string, h Handlers) *gin.Engine {
 	i.PATCH("/:id", h.Invoices.Update)
 	i.PATCH("/:id/status", h.Invoices.Status)
 	i.DELETE("/:id", h.Invoices.Delete)
+
+	w := r.Group("/work-orders")
+	w.GET("", h.WorkOrders.List)
+	w.GET("/:id", h.WorkOrders.Get)
+	w.PATCH("/:id", h.WorkOrders.Update)
+	w.PATCH("/:id/status", h.WorkOrders.Status)
+	w.DELETE("/:id", h.WorkOrders.Delete)
 	return r
 }

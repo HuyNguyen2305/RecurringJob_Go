@@ -8,13 +8,11 @@ import (
 )
 
 func TestCanTransition(t *testing.T) {
-	all := []string{service.StatusUnconfirmed, service.StatusConfirmed, service.StatusInProgress, service.StatusCompleted, service.StatusCanceled, service.StatusTerminateService, service.StatusRescheduled}
+	all := []string{service.StatusUnconfirmed, service.StatusConfirmed, service.StatusCompleted, service.StatusCanceled, service.StatusTerminateService, service.StatusRescheduled}
 	allowed := map[[2]string]bool{
-		{service.StatusUnconfirmed, service.StatusConfirmed}:  true,
-		{service.StatusUnconfirmed, service.StatusInProgress}: true,
-		{service.StatusConfirmed, service.StatusInProgress}:   true,
+		{service.StatusUnconfirmed, service.StatusConfirmed}: true,
 	}
-	for _, from := range []string{service.StatusUnconfirmed, service.StatusConfirmed, service.StatusInProgress} {
+	for _, from := range []string{service.StatusUnconfirmed, service.StatusConfirmed} {
 		for _, to := range finalStatuses {
 			allowed[[2]string{from, to}] = true
 		}
@@ -35,7 +33,6 @@ func TestStatusSets(t *testing.T) {
 	}{
 		{service.StatusUnconfirmed, true, false, false},
 		{service.StatusConfirmed, true, false, false},
-		{service.StatusInProgress, true, false, false},
 		{service.StatusCompleted, false, true, true},
 		{service.StatusCanceled, false, true, true},
 		{service.StatusRescheduled, false, true, true},
@@ -54,8 +51,7 @@ func TestAllowedFrom(t *testing.T) {
 		want []string
 	}{
 		{service.StatusConfirmed, []string{service.StatusUnconfirmed}},
-		{service.StatusInProgress, []string{service.StatusUnconfirmed, service.StatusConfirmed}},
-		{service.StatusCompleted, []string{service.StatusUnconfirmed, service.StatusConfirmed, service.StatusInProgress}},
+		{service.StatusCompleted, []string{service.StatusUnconfirmed, service.StatusConfirmed}},
 		{service.StatusUnconfirmed, nil},
 	}
 	for _, tt := range tests {
@@ -71,11 +67,10 @@ func TestEffectiveStatus(t *testing.T) {
 		first bool
 		want  string
 	}{
-		{service.StatusInProgress, true, service.StatusInProgress},
 		{service.StatusCompleted, true, service.StatusCompleted},
 		{service.StatusConfirmed, false, service.StatusConfirmed},
 		{service.StatusUnconfirmed, false, service.StatusUnconfirmed},
-		{service.StatusInProgress, false, service.StatusUnconfirmed},
+		{service.StatusCanceled, false, service.StatusUnconfirmed},
 		{service.StatusCompleted, false, service.StatusUnconfirmed},
 	}
 	for _, tt := range tests {
@@ -98,12 +93,12 @@ func TestValidateJobCreateStatus(t *testing.T) {
 }
 
 func TestValidateJobCreateStatusAll(t *testing.T) {
-	for _, s := range []string{service.StatusUnconfirmed, service.StatusConfirmed, service.StatusInProgress, service.StatusCompleted, service.StatusCanceled, service.StatusTerminateService} {
+	for _, s := range []string{service.StatusUnconfirmed, service.StatusConfirmed, service.StatusCompleted, service.StatusCanceled, service.StatusTerminateService} {
 		if err := service.ValidateJobCreateStatus(s); err != nil {
 			t.Errorf("%s: %v", s, err)
 		}
 	}
-	for _, s := range []string{service.StatusRescheduled, "", "UNCONFIRMED", " confirmed", "done"} {
+	for _, s := range []string{service.StatusRescheduled, "in_progress", "UNCONFIRMED", " confirmed", "done"} {
 		if got := statusOf(t, service.ValidateJobCreateStatus(s)); got != 400 {
 			t.Errorf("%q: status %d, want 400", s, got)
 		}

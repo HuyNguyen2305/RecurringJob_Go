@@ -297,7 +297,7 @@ func TestUpdateOccurrence(t *testing.T) {
 			t.Fatal(err)
 		}
 		repo.afterList = func() { repo.byDate("2026-09-29").Status = service.StatusCompleted }
-		_, err := s.UpdateOccurrence(ctx, "00000000-0000-0000-0000-00000000000a", dt("2026-09-29"), upd(service.StatusInProgress))
+		_, err := s.UpdateOccurrence(ctx, "00000000-0000-0000-0000-00000000000a", dt("2026-09-29"), upd(service.StatusConfirmed))
 		if got := statusOf(t, err); got != 409 {
 			t.Fatalf("status %d, want 409", got)
 		}
@@ -447,7 +447,7 @@ func uid(suffix string) string { return "00000000-0000-0000-0000-0000000000" + s
 
 func unconfirmed(j *model.Job) *model.Job { j.Status = service.StatusUnconfirmed; return j }
 
-var allStatuses = []string{service.StatusUnconfirmed, service.StatusConfirmed, service.StatusInProgress, service.StatusCompleted, service.StatusCanceled, service.StatusTerminateService, service.StatusRescheduled}
+var allStatuses = []string{service.StatusUnconfirmed, service.StatusConfirmed, service.StatusCompleted, service.StatusCanceled, service.StatusTerminateService, service.StatusRescheduled}
 
 // Every stored status x every requested status, checked against the rules.
 func TestUpdateOccurrenceTransitionMatrix(t *testing.T) {
@@ -506,8 +506,8 @@ func TestUpdateOccurrenceTransitionMatrix(t *testing.T) {
 func TestUpdateOccurrenceUsesEffectiveStatusWhenThereIsNoRow(t *testing.T) {
 	ctx := context.Background()
 	id := uid("a2")
-	for _, jobStatus := range []string{service.StatusUnconfirmed, service.StatusConfirmed, service.StatusInProgress, service.StatusCompleted, service.StatusCanceled, service.StatusTerminateService} {
-		for _, to := range []string{service.StatusConfirmed, service.StatusInProgress, service.StatusCanceled} {
+	for _, jobStatus := range []string{service.StatusUnconfirmed, service.StatusConfirmed, service.StatusCompleted, service.StatusCanceled, service.StatusTerminateService} {
+		for _, to := range []string{service.StatusConfirmed, service.StatusCompleted, service.StatusCanceled} {
 			t.Run(jobStatus+" job, request "+to, func(t *testing.T) {
 				job := oneOff(id, "2026-09-29")
 				job.Status = jobStatus
@@ -526,15 +526,15 @@ func TestUpdateOccurrenceUsesEffectiveStatusWhenThereIsNoRow(t *testing.T) {
 		}
 	}
 
-	t.Run("a later occurrence of an in_progress job starts unconfirmed", func(t *testing.T) {
+	t.Run("a later occurrence of a confirmed job starts confirmed", func(t *testing.T) {
 		job := recJob(id, "2026-09-29", recurrence.Rule{Frequency: "daily"})
-		job.Status = service.StatusInProgress
+		job.Status = service.StatusConfirmed
 		s, _ := newService(mockJobs{id: job})
 		if _, err := s.UpdateOccurrence(ctx, id, dt("2026-09-29"), upd(service.StatusCompleted)); err != nil {
-			t.Fatalf("first occurrence (in_progress) must be completable: %v", err)
+			t.Fatalf("first occurrence must be completable: %v", err)
 		}
-		if _, err := s.UpdateOccurrence(ctx, id, dt("2026-09-30"), upd(service.StatusConfirmed)); err != nil {
-			t.Fatalf("later occurrence must start unconfirmed and accept confirmed: %v", err)
+		if _, err := s.UpdateOccurrence(ctx, id, dt("2026-09-30"), upd(service.StatusConfirmed)); statusOf(t, err) != 409 {
+			t.Fatalf("a later occurrence already is confirmed, so confirming it again is refused: %v", err)
 		}
 	})
 }
@@ -759,7 +759,7 @@ func TestInfrastructureErrorsPropagate(t *testing.T) {
 		s := build(f)
 		_ = f.memOccRepo.Create(ctx, &model.JobOccurrence{JobID: id, OccurrenceDate: date, Status: service.StatusConfirmed})
 		f.updateErr = boom
-		_, err := s.UpdateOccurrence(ctx, id, date, upd(service.StatusInProgress))
+		_, err := s.UpdateOccurrence(ctx, id, date, upd(service.StatusCompleted))
 		rawBoom(t, err)
 	})
 	t.Run("transaction fails", func(t *testing.T) {
@@ -1127,7 +1127,7 @@ func TestCancelingOrTerminatingAnOccurrenceVoidsItsInvoices(t *testing.T) {
 	}
 
 	t.Run("other status changes leave invoices alone", func(t *testing.T) {
-		for _, status := range []string{service.StatusConfirmed, service.StatusInProgress, service.StatusCompleted} {
+		for _, status := range []string{service.StatusConfirmed, service.StatusCompleted} {
 			s, _ := newService(newJob())
 			voider := &fakeInvoices{paid: []string{"inv-1"}}
 			s.WithInvoices(voider)

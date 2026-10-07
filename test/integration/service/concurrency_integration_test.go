@@ -55,7 +55,7 @@ func TestIntegrationConcurrentStatusRace(t *testing.T) {
 	svc := build(db, nil)
 	today := civil.Today()
 	statuses := []string{
-		service.StatusConfirmed, service.StatusInProgress, service.StatusCompleted, service.StatusCanceled,
+		service.StatusConfirmed, service.StatusConfirmed, service.StatusCompleted, service.StatusCanceled,
 		service.StatusTerminateService, service.StatusConfirmed, service.StatusCanceled, service.StatusCompleted,
 	}
 

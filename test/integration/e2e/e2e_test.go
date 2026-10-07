@@ -256,6 +256,7 @@ func TestE2EValidation(t *testing.T) {
 	post(`{"date":"2026-02-30"}`, 400)
 	post(`{"date":"2026-10-02","status":"rescheduled"}`, 400)
 	post(`{"date":"2026-10-02","status":"bogus"}`, 400)
+	post(`{"date":"2026-10-02","status":"in_progress"}`, 400) // no longer a status
 	post(`{"date":"2026-10-02","status":"confirmed"}`, 200)
 	post(rec(`{"frequency":"hourly"}`), 400)
 	post(rec(`{"frequency":"weekly"}`), 400)

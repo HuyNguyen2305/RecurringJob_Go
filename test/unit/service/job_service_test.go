@@ -159,7 +159,7 @@ func TestJobServiceMore(t *testing.T) {
 	})
 
 	t.Run("every creatable status is kept as given", func(t *testing.T) {
-		for _, st := range []string{service.StatusUnconfirmed, service.StatusConfirmed, service.StatusInProgress, service.StatusCompleted, service.StatusCanceled, service.StatusTerminateService} {
+		for _, st := range []string{service.StatusUnconfirmed, service.StatusConfirmed, service.StatusCompleted, service.StatusCanceled, service.StatusTerminateService} {
 			s, _ := newJobService()
 			job, err := s.CreateJob(ctx, service.CreateJobInput{CustomerID: refCustomer, LocationID: refLocation, ServiceTypeID: refService, StartTime: "09:00", LengthMinutes: 60, Date: dt("2026-10-02"), Status: st})
 			if err != nil || job.Status != st {

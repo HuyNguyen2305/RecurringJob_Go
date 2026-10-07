@@ -14,7 +14,7 @@ import (
 )
 
 // realMigrations are the files in the repository's migrations folder, in order.
-var realMigrations = []string{"0001_reference_data.sql", "0002_jobs_and_occurrences.sql", "0003_customer_documents.sql", "0004_tenant_settings.sql", "0005_document_lifecycle.sql"}
+var realMigrations = []string{"0001_reference_data.sql", "0002_jobs_and_occurrences.sql", "0003_customer_documents.sql", "0004_tenant_settings.sql", "0005_document_lifecycle.sql", "0006_work_orders.sql", "0007_remove_in_progress.sql"}
 
 func TestMain(m *testing.M) {
 	helpers.ApplyLocalTZ()
@@ -143,6 +143,70 @@ func TestApplyRealMigrations(t *testing.T) {
 			t.Fatalf("res=%+v err=%v", res, err)
 		}
 	})
+}
+
+// copyMigration copies one real migration file into dir.
+func copyMigration(t *testing.T, dir, name string) {
+	t.Helper()
+	sql, err := os.ReadFile(filepath.Join(helpers.MigrationsDir(), name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeSQL(t, dir, name, string(sql))
+}
+
+func TestRemoveInProgressMigration(t *testing.T) {
+	db := helpers.Connect(t)
+	schema := newName(t, db)
+	dir := t.TempDir()
+	for _, name := range realMigrations[:len(realMigrations)-1] {
+		copyMigration(t, dir, name)
+	}
+	if _, err := migrator.Apply(db, schema, dir); err != nil {
+		t.Fatal(err)
+	}
+
+	// A job and a stored occurrence that are still in_progress before the migration.
+	q := func(format string) string { return strings.ReplaceAll(format, "S.", schema+".") }
+	for _, stmt := range []string{
+		`INSERT INTO S.customers (id, name) VALUES ('00000000-0000-0000-0000-0000000000c1', 'Ada')`,
+		`INSERT INTO S.locations (id, customer_id, address_line1) VALUES ('00000000-0000-0000-0000-0000000000a1', '00000000-0000-0000-0000-0000000000c1', '1 Main Street')`,
+		`INSERT INTO S.service_types (id, name) VALUES ('00000000-0000-0000-0000-0000000000b1', 'Window cleaning')`,
+		`INSERT INTO S.jobs (id, customer_id, location_id, service_type_id, date, start_time, length_minutes, status)
+			VALUES ('00000000-0000-0000-0000-0000000000e1', '00000000-0000-0000-0000-0000000000c1', '00000000-0000-0000-0000-0000000000a1', '00000000-0000-0000-0000-0000000000b1', '2026-10-01', '09:00', 60, 'in_progress')`,
+		`INSERT INTO S.job_occurrences (job_id, occurrence_date, status) VALUES ('00000000-0000-0000-0000-0000000000e1', '2026-10-02', 'in_progress')`,
+		`INSERT INTO S.job_occurrences (job_id, occurrence_date, status) VALUES ('00000000-0000-0000-0000-0000000000e1', '2026-10-03', 'canceled')`,
+	} {
+		if err := db.Exec(q(stmt)).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	copyMigration(t, dir, realMigrations[len(realMigrations)-1])
+	res, err := migrator.Apply(db, schema, dir)
+	if err != nil || !reflect.DeepEqual(res.Applied, []string{"0007_remove_in_progress.sql"}) {
+		t.Fatalf("res=%+v err=%v", res, err)
+	}
+
+	var jobStatus string
+	db.Raw(q(`SELECT status FROM S.jobs`)).Scan(&jobStatus)
+	var occStatuses []string
+	db.Raw(q(`SELECT status FROM S.job_occurrences ORDER BY occurrence_date`)).Scan(&occStatuses)
+	if jobStatus != "confirmed" || !reflect.DeepEqual(occStatuses, []string{"confirmed", "canceled"}) {
+		t.Fatalf("job %q occurrences %v: in_progress rows must become confirmed and others stay", jobStatus, occStatuses)
+	}
+
+	// The constraints now refuse in_progress on both tables.
+	if err := db.Exec(q(`UPDATE S.jobs SET status = 'in_progress'`)).Error; err == nil {
+		t.Error("jobs still accept in_progress")
+	}
+	if err := db.Exec(q(`UPDATE S.job_occurrences SET status = 'in_progress' WHERE status = 'confirmed'`)).Error; err == nil {
+		t.Error("job_occurrences still accept in_progress")
+	}
+	// Rescheduled stays occurrence-only.
+	if err := db.Exec(q(`UPDATE S.jobs SET status = 'rescheduled'`)).Error; err == nil {
+		t.Error("jobs accept rescheduled")
+	}
 }
 
 func TestApplyOrderingAndIncrementalFiles(t *testing.T) {

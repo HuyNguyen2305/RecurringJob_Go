@@ -5,7 +5,6 @@ import "recurringjob/internal/common/apperror"
 const (
 	StatusUnconfirmed      = "unconfirmed"
 	StatusConfirmed        = "confirmed"
-	StatusInProgress       = "in_progress"
 	StatusCompleted        = "completed"
 	StatusCanceled         = "canceled"
 	StatusTerminateService = "terminate_service"
@@ -13,7 +12,7 @@ const (
 )
 
 var (
-	openStatuses  = []string{StatusUnconfirmed, StatusConfirmed, StatusInProgress}
+	openStatuses  = []string{StatusUnconfirmed, StatusConfirmed}
 	finalStatuses = []string{StatusCompleted, StatusCanceled, StatusRescheduled, StatusTerminateService}
 )
 
@@ -45,10 +44,8 @@ func IsFinal(s string) bool { return contains(finalStatuses, s) }
 func CanTransition(from, to string) bool {
 	switch from {
 	case StatusUnconfirmed:
-		return to == StatusConfirmed || to == StatusInProgress || IsFinal(to)
+		return to == StatusConfirmed || IsFinal(to)
 	case StatusConfirmed:
-		return to == StatusInProgress || IsFinal(to)
-	case StatusInProgress:
 		return IsFinal(to)
 	}
 	return false

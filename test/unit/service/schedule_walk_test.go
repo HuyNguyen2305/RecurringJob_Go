@@ -97,8 +97,8 @@ func TestWalkSchedule(t *testing.T) {
 			want: []brief{{"2026-10-01", service.StateReal, "rescheduled"}, {"2026-10-05", service.StateReal, "rescheduled"}, {"2026-10-06", service.StateReal, "unconfirmed"}, {"2026-10-02", service.StateHollow, "unconfirmed"}, {"2026-10-03", service.StateHollow, "unconfirmed"}},
 		},
 		{
-			name: "job status applies to first occurrence only when not confirmable", slots: slots, jobStatus: service.StatusInProgress, today: "2026-10-01",
-			want: []brief{{"2026-10-01", service.StateReal, "in_progress"}, {"2026-10-02", service.StateHollow, "unconfirmed"}, {"2026-10-03", service.StateHollow, "unconfirmed"}},
+			name: "a completed job status applies to the first occurrence only, and the next one opens", slots: slots, jobStatus: service.StatusCompleted, today: "2026-10-01",
+			want: []brief{{"2026-10-01", service.StateReal, "completed"}, {"2026-10-02", service.StateReal, "unconfirmed"}, {"2026-10-03", service.StateHollow, "unconfirmed"}},
 		},
 		{
 			name: "confirmed job status carries to later occurrences", slots: slots, jobStatus: service.StatusConfirmed, today: "2026-10-01",
@@ -201,7 +201,7 @@ func TestWalkScheduleMore(t *testing.T) {
 // walk's structural rules.
 func TestWalkScheduleInvariants(t *testing.T) {
 	rng := rand.New(rand.NewSource(99))
-	all := []string{service.StatusUnconfirmed, service.StatusConfirmed, service.StatusInProgress, service.StatusCompleted, service.StatusCanceled, service.StatusTerminateService, service.StatusRescheduled}
+	all := []string{service.StatusUnconfirmed, service.StatusConfirmed, service.StatusCompleted, service.StatusCanceled, service.StatusTerminateService, service.StatusRescheduled}
 	base := dt("2026-10-01")
 	day := func(n int) string { return civil.Format(base.AddDate(0, 0, n)) }
 

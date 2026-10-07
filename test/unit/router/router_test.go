@@ -72,6 +72,32 @@ func (stubInvoices) Create(context.Context, string, time.Time, service.DocumentI
 	return stubDoc, nil
 }
 
+type stubWorkOrders struct{}
+
+var stubWorkOrder = &model.WorkOrder{ID: "w", Status: "draft"}
+
+func (stubWorkOrders) Create(context.Context, string, time.Time, service.WorkOrderInput) (*model.WorkOrder, error) {
+	return stubWorkOrder, nil
+}
+
+func (stubWorkOrders) Get(context.Context, string) (*model.WorkOrder, error) {
+	return stubWorkOrder, nil
+}
+
+func (stubWorkOrders) List(context.Context, service.WorkOrderListQuery) ([]model.WorkOrder, error) {
+	return nil, nil
+}
+
+func (stubWorkOrders) Update(context.Context, string, service.WorkOrderPatch) (*model.WorkOrder, error) {
+	return stubWorkOrder, nil
+}
+
+func (stubWorkOrders) ChangeStatus(context.Context, string, string) (*model.WorkOrder, error) {
+	return stubWorkOrder, nil
+}
+
+func (stubWorkOrders) Delete(context.Context, string) error { return nil }
+
 func handlers(jobs handler.JobService) router.Handlers {
 	return router.Handlers{
 		Settings:     handler.NewSettingsHandler(stubSettings{}),
@@ -81,6 +107,7 @@ func handlers(jobs handler.JobService) router.Handlers {
 		Occurrences:  handler.NewOccurrenceHandler(stubOccs{}),
 		Estimates:    handler.NewEstimateHandler(stubDocs{}),
 		Invoices:     handler.NewInvoiceHandler(stubInvoices{}),
+		WorkOrders:   handler.NewWorkOrderHandler(stubWorkOrders{}),
 	}
 }
 
@@ -127,6 +154,12 @@ func TestRoutes(t *testing.T) {
 		"POST /jobs",
 		"POST /service-types",
 		"POST /jobs/:id/occurrences/:date/invoice",
+		"POST /jobs/:id/occurrences/:date/work-order",
+		"GET /work-orders",
+		"GET /work-orders/:id",
+		"PATCH /work-orders/:id",
+		"PATCH /work-orders/:id/status",
+		"DELETE /work-orders/:id",
 	}
 	sort.Strings(want)
 	if strings.Join(got, "|") != strings.Join(want, "|") {
@@ -162,6 +195,12 @@ func TestRouterBehaviour(t *testing.T) {
 			{"PATCH", "/estimates/abc/status", `{"status":"sent"}`, 200},
 			{"POST", "/estimates/abc/approve", `{"date":"2026-10-12","startTime":"09:00","lengthMinutes":60}`, 200},
 			{"POST", "/jobs/abc/occurrences/2026-10-02/invoice", `{"notes":"n"}`, 200},
+			{"POST", "/jobs/abc/occurrences/2026-10-02/work-order", `{"notes":"n","tasks":[{"description":"Clean"}]}`, 200},
+			{"GET", "/work-orders", "", 200},
+			{"GET", "/work-orders/abc", "", 200},
+			{"PATCH", "/work-orders/abc", `{"notes":"x"}`, 200},
+			{"PATCH", "/work-orders/abc/status", `{"status":"scheduled"}`, 200},
+			{"DELETE", "/work-orders/abc", "", 200},
 			{"POST", "/customers", `{"name":"Ada"}`, 200},
 			{"GET", "/customers", "", 200},
 			{"GET", "/customers/abc", "", 200},

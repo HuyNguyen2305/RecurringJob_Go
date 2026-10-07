@@ -94,7 +94,7 @@ func TestOccurrenceRepository(t *testing.T) {
 			t.Fatalf("pg code %q, want 23514", code)
 		}
 		j := helpers.SeedJob(t, ctx, db, fixtures.DailyJob(civil.New(2026, 10, 1)))
-		for i, st := range []string{"unconfirmed", "confirmed", "in_progress", "completed", "canceled", "terminate_service", "rescheduled"} {
+		for i, st := range []string{"unconfirmed", "confirmed", "completed", "canceled", "terminate_service", "rescheduled"} {
 			if err := occs.Create(ctx, row(j.ID, civil.Format(civil.New(2026, 12, 1+i)), st)); err != nil {
 				t.Errorf("%s: %v", st, err)
 			}
@@ -184,7 +184,7 @@ func TestOccurrenceRepositoryUpdateGuarded(t *testing.T) {
 
 	t.Run("does nothing when the status is not in the allowed list", func(t *testing.T) {
 		r := seed("completed")
-		n, err := occs.UpdateGuarded(ctx, r.ID, []string{"unconfirmed", "confirmed", "in_progress"}, map[string]any{"status": "canceled"})
+		n, err := occs.UpdateGuarded(ctx, r.ID, []string{"unconfirmed", "confirmed"}, map[string]any{"status": "canceled"})
 		if err != nil || n != 0 {
 			t.Fatalf("n=%d err=%v", n, err)
 		}
@@ -230,7 +230,7 @@ func TestOccurrenceRepositoryUpdateGuarded(t *testing.T) {
 
 	t.Run("two sequential guarded updates: the second sees the first and affects nothing", func(t *testing.T) {
 		r := seed("unconfirmed")
-		allowed := []string{"unconfirmed", "confirmed", "in_progress"}
+		allowed := []string{"unconfirmed", "confirmed"}
 		n1, _ := occs.UpdateGuarded(ctx, r.ID, allowed, map[string]any{"status": "completed", "completed_at": time.Now()}) // completed needs completed_at
 		n2, _ := occs.UpdateGuarded(ctx, r.ID, allowed, map[string]any{"status": "canceled"})
 		if n1 != 1 || n2 != 0 || stored(r).Status != "completed" {
