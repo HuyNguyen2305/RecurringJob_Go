@@ -33,6 +33,16 @@ type WorkOrderStore interface {
 	// LockOccurrence takes the transaction-scoped lock of one occurrence; call
 	// it inside Transaction.
 	LockOccurrence(ctx context.Context, jobID string, date time.Time) error
+	// UpdateStatusForOccurrence moves the occurrence's work orders that are in
+	// one of allowedFrom to status and returns how many changed.
+	UpdateStatusForOccurrence(ctx context.Context, jobID string, date time.Time, allowedFrom []string, status string) (int64, error)
+	// MoveForOccurrence moves the occurrence's work orders that are in one of
+	// statuses from one occurrence date to another and returns how many moved.
+	MoveForOccurrence(ctx context.Context, jobID string, from, to time.Time, statuses []string) (int64, error)
+	// IDsForOccurrence returns the ids of the occurrence's work orders in one of statuses.
+	IDsForOccurrence(ctx context.Context, jobID string, date time.Time, statuses []string) ([]string, error)
+	// CountForJob returns how many work orders, in any status, the job has.
+	CountForJob(ctx context.Context, jobID string) (int64, error)
 	Transaction(ctx context.Context, fn func(ctx context.Context) error) error
 }
 
@@ -213,6 +223,11 @@ func (s *WorkOrderService) Update(ctx context.Context, id string, p WorkOrderPat
 		if !contains(workOrderEditableFrom, wo.Status) {
 			return apperror.Conflict("this work order is " + wo.Status + " and can no longer be edited")
 		}
+		// Scheduling needs a task and so does completing, so past draft the
+		// tasks cannot be emptied.
+		if p.Tasks != nil && len(tasks) == 0 && wo.Status != WOStatusDraft {
+			return apperror.Validation("a " + wo.Status + " work order must keep at least one task")
+		}
 		n, err := s.orders.UpdateContent(ctx, id, workOrderEditableFrom, fields, tasks)
 		if err != nil {
 			return err
@@ -249,6 +264,9 @@ func (s *WorkOrderService) ChangeStatus(ctx context.Context, id, to string) (*mo
 			return apperror.Validation("add at least one task before scheduling")
 		}
 		if to == WOStatusCompleted {
+			if len(wo.Tasks) == 0 {
+				return apperror.Validation("add at least one task before completing")
+			}
 			for i, t := range wo.Tasks {
 				if !t.Done {
 					return bad("task %d is not done yet", i+1)
@@ -272,6 +290,40 @@ func (s *WorkOrderService) ChangeStatus(ctx context.Context, id, to string) (*mo
 		return nil, err
 	}
 	return s.orders.Get(ctx, id)
+}
+
+// openWorkOrderStatuses are the statuses that still have work to do.
+var openWorkOrderStatuses = []string{WOStatusDraft, WOStatusScheduled, WOStatusInProgress}
+
+// notStartedWorkOrderStatuses are the statuses whose work has not begun.
+var notStartedWorkOrderStatuses = []string{WOStatusDraft, WOStatusScheduled}
+
+// CancelOpenForOccurrence cancels the occurrence's draft, scheduled and
+// in-progress work orders, for when the occurrence is canceled or terminated,
+// and returns how many it canceled. A completed work order is left alone: the
+// work was done. Call it inside the occurrence's transaction so both changes
+// commit together.
+func (s *WorkOrderService) CancelOpenForOccurrence(ctx context.Context, jobID string, date time.Time) (int64, error) {
+	return s.orders.UpdateStatusForOccurrence(ctx, jobID, civil.Truncate(date), openWorkOrderStatuses, WOStatusCanceled)
+}
+
+// MoveOpenForOccurrence moves the occurrence's draft and scheduled work orders
+// to its new date, for when the occurrence is rescheduled, and returns how many
+// it moved. Work that has started or finished stays where it is. Call it inside
+// the occurrence's transaction.
+func (s *WorkOrderService) MoveOpenForOccurrence(ctx context.Context, jobID string, from, to time.Time) (int64, error) {
+	return s.orders.MoveForOccurrence(ctx, jobID, civil.Truncate(from), civil.Truncate(to), notStartedWorkOrderStatuses)
+}
+
+// IDsForOccurrence returns the ids of the occurrence's work orders in one of
+// statuses.
+func (s *WorkOrderService) IDsForOccurrence(ctx context.Context, jobID string, date time.Time, statuses []string) ([]string, error) {
+	return s.orders.IDsForOccurrence(ctx, jobID, civil.Truncate(date), statuses)
+}
+
+// CountForJob returns how many work orders, in any status, the job has.
+func (s *WorkOrderService) CountForJob(ctx context.Context, jobID string) (int64, error) {
+	return s.orders.CountForJob(ctx, jobID)
 }
 
 // Delete removes a draft work order (and its tasks). Anything past draft is

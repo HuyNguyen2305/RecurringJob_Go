@@ -24,6 +24,10 @@ type OccurrenceResponse struct {
 	// PaidInvoiceIDs appears only when a canceled or terminated occurrence has
 	// paid invoices that were kept and need follow-up.
 	PaidInvoiceIDs []string `json:"paidInvoiceIds,omitempty"`
+	// KeptWorkOrderIDs appears only when a canceled, terminated or rescheduled
+	// occurrence has work orders that were left as they were (completed ones,
+	// and on a reschedule in-progress ones too).
+	KeptWorkOrderIDs []string `json:"keptWorkOrderIds,omitempty"`
 }
 
 func NewOccurrenceResponse(o *model.JobOccurrence) OccurrenceResponse {
@@ -40,6 +44,8 @@ func NewOccurrenceResponse(o *model.JobOccurrence) OccurrenceResponse {
 		RescheduledFrom: fmtDate(o.RescheduledFrom),
 		CompletedAt:     completed,
 		PaidInvoiceIDs:  o.PaidInvoiceIDs,
+
+		KeptWorkOrderIDs: o.KeptWorkOrderIDs,
 	}
 }
 

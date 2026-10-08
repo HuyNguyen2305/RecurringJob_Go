@@ -66,17 +66,24 @@ type InvoiceCounter interface {
 	CountForJob(ctx context.Context, jobID string) (int64, error)
 }
 
+// WorkOrderCounter counts a job's work orders in any status. WorkOrderService
+// satisfies it.
+type WorkOrderCounter interface {
+	CountForJob(ctx context.Context, jobID string) (int64, error)
+}
+
 // EstimateService holds the estimate business rules. Get, List and the shared
 // part of ChangeStatus come from the documentCore.
 type EstimateService struct {
 	*documentCore
-	estimates EstimateStore
-	jobs      JobCreator
-	refs      ReferenceResolver
-	invoices  PaidInvoiceChecker
-	reopen    *reopenDeps
-	today     TodayProvider
-	now       func() time.Time
+	estimates  EstimateStore
+	jobs       JobCreator
+	refs       ReferenceResolver
+	invoices   PaidInvoiceChecker
+	workOrders WorkOrderCounter
+	reopen     *reopenDeps
+	today      TodayProvider
+	now        func() time.Time
 }
 
 func NewEstimateService(estimates EstimateStore, jobs JobCreator, refs ReferenceResolver) *EstimateService {
@@ -117,6 +124,13 @@ type reopenDeps struct {
 // WithReopen enables undoing an approval. Without it Reopen fails.
 func (s *EstimateService) WithReopen(jobs JobRemover, occs OccurrenceRows, invoices InvoiceCounter) *EstimateService {
 	s.reopen = &reopenDeps{jobs: jobs, occs: occs, invoices: invoices}
+	return s
+}
+
+// WithWorkOrders makes Reopen refuse while the job has a work order. Without it
+// that check is skipped (the database still refuses to delete the job).
+func (s *EstimateService) WithWorkOrders(workOrders WorkOrderCounter) *EstimateService {
+	s.workOrders = workOrders
 	return s
 }
 
@@ -331,6 +345,15 @@ func (s *EstimateService) Reopen(ctx context.Context, id string) (*model.Custome
 		}
 		if invoices > 0 {
 			return apperror.Conflict("the job already has invoices, so the approval cannot be undone; cancel its occurrences instead")
+		}
+		if s.workOrders != nil {
+			workOrders, err := s.workOrders.CountForJob(ctx, jobID)
+			if err != nil {
+				return err
+			}
+			if workOrders > 0 {
+				return apperror.Conflict("the job already has work orders, so the approval cannot be undone; cancel its occurrences instead")
+			}
 		}
 		n, err := s.estimates.MarkReopened(ctx, id, []string{DocStatusApproved}, DocStatusSent)
 		if err != nil {

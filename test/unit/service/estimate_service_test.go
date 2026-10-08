@@ -657,6 +657,14 @@ func TestEstimateEditsKeepRevisions(t *testing.T) {
 	})
 }
 
+// fakeWorkOrderCounter answers how many work orders a job has.
+type fakeWorkOrderCounter struct {
+	n   int64
+	err error
+}
+
+func (f fakeWorkOrderCounter) CountForJob(context.Context, string) (int64, error) { return f.n, f.err }
+
 func TestEstimateReopen(t *testing.T) {
 	ctx := context.Background()
 	approved := func(store *memDocs) *model.CustomerDocument {
@@ -745,6 +753,39 @@ func TestEstimateReopen(t *testing.T) {
 			}
 			if len(jobs.deleted) != 0 {
 				t.Errorf("%s: the job was deleted", name)
+			}
+		}
+	})
+
+	t.Run("a work order of the job (any status) blocks it; a failing count comes back as is", func(t *testing.T) {
+		boom := errors.New("db down")
+		for name, c := range map[string]struct {
+			counter fakeWorkOrderCounter
+			want    int
+			isErr   error
+		}{
+			"has work orders": {fakeWorkOrderCounter{n: 1}, 409, nil},
+			"none":            {fakeWorkOrderCounter{}, 0, nil},
+			"count fails":     {fakeWorkOrderCounter{err: boom}, 0, boom},
+		} {
+			store := newMemDocs()
+			d := approved(store)
+			s, jobs := setup(store, fakeOccRows{})
+			s.WithWorkOrders(c.counter)
+			got, err := s.Reopen(ctx, d.ID)
+			switch {
+			case c.isErr != nil:
+				if !errors.Is(err, c.isErr) || len(jobs.deleted) != 0 {
+					t.Errorf("%s: err=%v deleted=%v", name, err, jobs.deleted)
+				}
+			case c.want != 0:
+				if statusOf(t, err) != c.want || len(jobs.deleted) != 0 || len(store.reopened) != 0 {
+					t.Errorf("%s: err=%v deleted=%v reopened=%v", name, err, jobs.deleted, store.reopened)
+				}
+			default:
+				if err != nil || got.Status != "sent" || len(jobs.deleted) != 1 {
+					t.Errorf("%s: err=%v got=%+v deleted=%v", name, err, got, jobs.deleted)
+				}
 			}
 		}
 	})

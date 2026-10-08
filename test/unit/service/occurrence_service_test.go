@@ -1194,6 +1194,112 @@ func TestCancelingOrTerminatingAnOccurrenceVoidsItsInvoices(t *testing.T) {
 	})
 }
 
+// fakeWorkOrders records what the occurrence service asks of the work order side.
+type fakeWorkOrders struct {
+	canceled                   []voidCall
+	moved                      []moveCall
+	kept                       []string
+	cancelErr, moveErr, idsErr error
+	idsAsked                   [][]string
+}
+
+func (f *fakeWorkOrders) CancelOpenForOccurrence(_ context.Context, jobID string, date time.Time) (int64, error) {
+	f.canceled = append(f.canceled, voidCall{jobID: jobID, date: date})
+	return 1, f.cancelErr
+}
+
+func (f *fakeWorkOrders) MoveOpenForOccurrence(_ context.Context, jobID string, from, to time.Time) (int64, error) {
+	f.moved = append(f.moved, moveCall{jobID, from, to})
+	return 1, f.moveErr
+}
+
+func (f *fakeWorkOrders) IDsForOccurrence(_ context.Context, _ string, _ time.Time, statuses []string) ([]string, error) {
+	f.idsAsked = append(f.idsAsked, statuses)
+	return f.kept, f.idsErr
+}
+
+func TestAnOccurrenceChangeCarriesItsWorkOrdersAlong(t *testing.T) {
+	ctx := context.Background()
+	jobID := uid("b3")
+	newJob := func() mockJobs {
+		job := recJob(jobID, "2026-10-02", recurrence.Rule{Frequency: "weekly", WeeklyPeriod: "every", WeeklyDaysOfWeek: []int{5}})
+		job.Status = service.StatusUnconfirmed
+		return mockJobs{jobID: job}
+	}
+
+	for _, status := range []string{service.StatusCanceled, service.StatusTerminateService} {
+		t.Run(status+" cancels the open work orders and reports the completed ones", func(t *testing.T) {
+			s, _ := newService(newJob())
+			wo := &fakeWorkOrders{kept: []string{"wo-done"}}
+			s.WithWorkOrders(wo)
+			saved, err := s.UpdateOccurrence(ctx, jobID, dt("2026-10-02"), upd(status))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(wo.canceled) != 1 || wo.canceled[0].jobID != jobID || !wo.canceled[0].date.Equal(dt("2026-10-02")) || len(wo.moved) != 0 {
+				t.Fatalf("calls canceled=%+v moved=%+v", wo.canceled, wo.moved)
+			}
+			if !reflect.DeepEqual(wo.idsAsked, [][]string{{service.WOStatusCompleted}}) || !reflect.DeepEqual(saved.KeptWorkOrderIDs, []string{"wo-done"}) {
+				t.Fatalf("asked %v saved %+v", wo.idsAsked, saved)
+			}
+		})
+	}
+
+	t.Run("rescheduling moves the work orders that have not started and reports the rest", func(t *testing.T) {
+		s, repo := newService(newJob())
+		wo := &fakeWorkOrders{kept: []string{"wo-busy", "wo-done"}}
+		s.WithWorkOrders(wo)
+		to := dt("2026-10-03")
+		saved, err := s.UpdateOccurrence(ctx, jobID, dt("2026-10-02"), service.UpdateOccurrenceRequest{Status: service.StatusRescheduled, RescheduledTo: &to})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(wo.canceled) != 0 || len(wo.moved) != 1 || !wo.moved[0].from.Equal(dt("2026-10-02")) || !wo.moved[0].to.Equal(to) {
+			t.Fatalf("calls canceled=%+v moved=%+v", wo.canceled, wo.moved)
+		}
+		if !reflect.DeepEqual(wo.idsAsked, [][]string{{service.WOStatusInProgress, service.WOStatusCompleted}}) ||
+			!reflect.DeepEqual(saved.KeptWorkOrderIDs, []string{"wo-busy", "wo-done"}) || repo.byDate("2026-10-03") == nil {
+			t.Fatalf("asked %v saved %+v", wo.idsAsked, saved)
+		}
+	})
+
+	t.Run("other status changes leave work orders alone", func(t *testing.T) {
+		for _, status := range []string{service.StatusConfirmed, service.StatusCompleted} {
+			s, _ := newService(newJob())
+			wo := &fakeWorkOrders{kept: []string{"wo-1"}}
+			s.WithWorkOrders(wo)
+			saved, err := s.UpdateOccurrence(ctx, jobID, dt("2026-10-02"), upd(status))
+			if err != nil || len(wo.canceled)+len(wo.moved)+len(wo.idsAsked) != 0 || len(saved.KeptWorkOrderIDs) != 0 {
+				t.Errorf("%s: err=%v wo=%+v saved=%+v", status, err, wo, saved)
+			}
+		}
+	})
+
+	t.Run("a failure rolls the occurrence change back", func(t *testing.T) {
+		boom := errors.New("db down")
+		to := dt("2026-10-03")
+		reschedule := service.UpdateOccurrenceRequest{Status: service.StatusRescheduled, RescheduledTo: &to}
+		for name, c := range map[string]struct {
+			wo  *fakeWorkOrders
+			req service.UpdateOccurrenceRequest
+		}{
+			"cancel fails":      {&fakeWorkOrders{cancelErr: boom}, upd(service.StatusCanceled)},
+			"lookup fails":      {&fakeWorkOrders{idsErr: boom}, upd(service.StatusCanceled)},
+			"move fails":        {&fakeWorkOrders{moveErr: boom}, reschedule},
+			"reschedule lookup": {&fakeWorkOrders{idsErr: boom}, reschedule},
+		} {
+			s, repo := newService(newJob())
+			s.WithWorkOrders(c.wo)
+			if _, err := s.UpdateOccurrence(ctx, jobID, dt("2026-10-02"), c.req); !errors.Is(err, boom) {
+				t.Errorf("%s: %v", name, err)
+			}
+			if repo.byDate("2026-10-02") != nil || repo.byDate("2026-10-03") != nil {
+				t.Errorf("%s: the change stayed although its work orders were not handled", name)
+			}
+		}
+	})
+}
+
 func TestOccurrencesUseTheTenantsToday(t *testing.T) {
 	ctx := context.Background()
 	id := uid("a4")

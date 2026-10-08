@@ -147,6 +147,57 @@ func (r *WorkOrderRepository) UpdateStatusGuarded(ctx context.Context, id string
 	return n, err
 }
 
+// UpdateStatusForOccurrence moves the occurrence's work orders that are in one
+// of allowedFrom to status and returns how many changed. The date is compared
+// as a plain YYYY-MM-DD so the session time zone cannot shift it.
+func (r *WorkOrderRepository) UpdateStatusForOccurrence(ctx context.Context, jobID string, date time.Time, allowedFrom []string, status string) (int64, error) {
+	var n int64
+	err := r.WithSchema(ctx, func(tx *gorm.DB) error {
+		res := tx.Model(&model.WorkOrder{}).
+			Where("job_id = ? AND occurrence_date = ?::date AND status IN ?", jobID, civil.Format(date), allowedFrom).
+			Updates(map[string]any{"status": status, "updated_at": time.Now().UTC()})
+		n = res.RowsAffected
+		return res.Error
+	})
+	return n, err
+}
+
+// MoveForOccurrence moves the occurrence's work orders that are in one of
+// statuses from the occurrence on from to the occurrence on to and returns how
+// many moved.
+func (r *WorkOrderRepository) MoveForOccurrence(ctx context.Context, jobID string, from, to time.Time, statuses []string) (int64, error) {
+	var n int64
+	err := r.WithSchema(ctx, func(tx *gorm.DB) error {
+		res := tx.Model(&model.WorkOrder{}).
+			Where("job_id = ? AND occurrence_date = ?::date AND status IN ?", jobID, civil.Format(from), statuses).
+			Updates(map[string]any{"occurrence_date": civil.Format(to), "updated_at": time.Now().UTC()})
+		n = res.RowsAffected
+		return res.Error
+	})
+	return n, err
+}
+
+// IDsForOccurrence returns the ids of the occurrence's work orders in one of
+// statuses, oldest first; never nil.
+func (r *WorkOrderRepository) IDsForOccurrence(ctx context.Context, jobID string, date time.Time, statuses []string) ([]string, error) {
+	ids := []string{}
+	err := r.WithSchema(ctx, func(tx *gorm.DB) error {
+		return tx.Model(&model.WorkOrder{}).
+			Where("job_id = ? AND occurrence_date = ?::date AND status IN ?", jobID, civil.Format(date), statuses).
+			Order("created_at, id").Pluck("id", &ids).Error
+	})
+	return ids, err
+}
+
+// CountForJob returns how many work orders, in any status, the job has.
+func (r *WorkOrderRepository) CountForJob(ctx context.Context, jobID string) (int64, error) {
+	var n int64
+	err := r.WithSchema(ctx, func(tx *gorm.DB) error {
+		return tx.Model(&model.WorkOrder{}).Where("job_id = ?", jobID).Count(&n).Error
+	})
+	return n, err
+}
+
 // DeleteGuarded deletes the work order (its tasks go with it) only while its
 // status is still one of allowedFrom and returns the rows affected.
 func (r *WorkOrderRepository) DeleteGuarded(ctx context.Context, id string, allowedFrom []string) (int64, error) {

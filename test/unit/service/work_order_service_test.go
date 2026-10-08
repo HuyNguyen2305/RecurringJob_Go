@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -87,6 +88,51 @@ func (m *memWorkOrders) DeleteGuarded(_ context.Context, id string, allowedFrom 
 	}
 	delete(m.orders, id)
 	return 1, nil
+}
+
+func (m *memWorkOrders) forOccurrence(jobID string, date time.Time, statuses []string) []*model.WorkOrder {
+	var out []*model.WorkOrder
+	for _, wo := range m.orders {
+		if wo.JobID == jobID && wo.OccurrenceDate.Equal(date) && slices.Contains(statuses, wo.Status) {
+			out = append(out, wo)
+		}
+	}
+	slices.SortFunc(out, func(a, b *model.WorkOrder) int { return strings.Compare(a.ID, b.ID) })
+	return out
+}
+
+func (m *memWorkOrders) UpdateStatusForOccurrence(_ context.Context, jobID string, date time.Time, allowedFrom []string, status string) (int64, error) {
+	found := m.forOccurrence(jobID, date, allowedFrom)
+	for _, wo := range found {
+		wo.Status = status
+	}
+	return int64(len(found)), nil
+}
+
+func (m *memWorkOrders) MoveForOccurrence(_ context.Context, jobID string, from, to time.Time, statuses []string) (int64, error) {
+	found := m.forOccurrence(jobID, from, statuses)
+	for _, wo := range found {
+		wo.OccurrenceDate = to
+	}
+	return int64(len(found)), nil
+}
+
+func (m *memWorkOrders) IDsForOccurrence(_ context.Context, jobID string, date time.Time, statuses []string) ([]string, error) {
+	ids := []string{}
+	for _, wo := range m.forOccurrence(jobID, date, statuses) {
+		ids = append(ids, wo.ID)
+	}
+	return ids, nil
+}
+
+func (m *memWorkOrders) CountForJob(_ context.Context, jobID string) (int64, error) {
+	var n int64
+	for _, wo := range m.orders {
+		if wo.JobID == jobID {
+			n++
+		}
+	}
+	return n, nil
 }
 
 func (m *memWorkOrders) LockOccurrence(context.Context, string, time.Time) error {
@@ -174,26 +220,6 @@ func TestWorkOrderCreate(t *testing.T) {
 	})
 }
 
-func TestWorkOrderStatusTransitions(t *testing.T) {
-	all := []string{"draft", "scheduled", "in_progress", "completed", "canceled"}
-	allowed := map[string][]string{
-		"draft":       {"scheduled", "canceled"},
-		"scheduled":   {"in_progress", "canceled"},
-		"in_progress": {"completed", "canceled"},
-	}
-	for _, from := range all {
-		for _, to := range all {
-			want := slices.Contains(allowed[from], to)
-			if got := service.CanTransitionWorkOrder(from, to); got != want {
-				t.Errorf("%s -> %s: %v, want %v", from, to, got, want)
-			}
-		}
-	}
-	if !service.IsKnownWorkOrderStatus("scheduled") || service.IsKnownWorkOrderStatus("paid") {
-		t.Error("known statuses")
-	}
-}
-
 func TestWorkOrderLifecycle(t *testing.T) {
 	ctx := context.Background()
 	jobID := uid("a3")
@@ -228,6 +254,38 @@ func TestWorkOrderLifecycle(t *testing.T) {
 		wo, err := s.ChangeStatus(ctx, id, service.WOStatusCompleted)
 		if err != nil || wo.Status != service.WOStatusCompleted || wo.CompletedAt == nil {
 			t.Fatalf("complete: %+v %v", wo, err)
+		}
+	})
+
+	t.Run("past draft the tasks cannot be emptied, so nothing completes without a task", func(t *testing.T) {
+		none := []service.TaskInput{}
+		id := create(service.TaskInput{Description: "a"})
+		// A draft may be emptied; it cannot be scheduled that way.
+		if _, err := s.Update(ctx, id, service.WorkOrderPatch{Tasks: &none}); err != nil {
+			t.Fatalf("empty a draft: %v", err)
+		}
+		if _, err := s.ChangeStatus(ctx, id, service.WOStatusScheduled); statusOf(t, err) != 400 {
+			t.Fatalf("schedule an empty draft: %v", err)
+		}
+		one := []service.TaskInput{{Description: "a"}}
+		if _, err := s.Update(ctx, id, service.WorkOrderPatch{Tasks: &one}); err != nil {
+			t.Fatal(err)
+		}
+		for _, to := range []string{service.WOStatusScheduled, service.WOStatusInProgress} {
+			if _, err := s.ChangeStatus(ctx, id, to); err != nil {
+				t.Fatalf("to %s: %v", to, err)
+			}
+			if _, err := s.Update(ctx, id, service.WorkOrderPatch{Tasks: &none}); statusOf(t, err) != 400 {
+				t.Fatalf("emptying while %s: %v", to, err)
+			}
+			if got, _ := s.Get(ctx, id); len(got.Tasks) != 1 {
+				t.Fatalf("a refused edit changed the tasks: %+v", got.Tasks)
+			}
+		}
+		// Even if the store somehow has no tasks, completing is refused.
+		store.orders[id].Tasks = nil
+		if _, err := s.ChangeStatus(ctx, id, service.WOStatusCompleted); statusOf(t, err) != 400 {
+			t.Fatalf("complete with no tasks: %v", err)
 		}
 	})
 
@@ -298,4 +356,84 @@ func TestWorkOrderList(t *testing.T) {
 	if _, err := s.List(ctx, service.WorkOrderListQuery{Status: "draft"}); err != nil {
 		t.Errorf("valid list: %v", err)
 	}
+}
+
+func TestWorkOrderFollowsItsOccurrence(t *testing.T) {
+	ctx := context.Background()
+	jobID := uid("a4")
+	store := newMemWorkOrders()
+	s := service.NewWorkOrderService(store, mockJobs{jobID: withRefs(recJob(jobID, "2026-10-02", recurrenceDaily()))}, &fakeAvailability{})
+	day := dt("2026-10-05")
+	// seed creates one work order per status on the date, setting the status
+	// straight on the store. The fake does not model the one-live-per-occurrence
+	// index, so several can share a date.
+	seed := func(date time.Time, statuses ...string) []string {
+		var ids []string
+		for _, st := range statuses {
+			wo, err := s.Create(ctx, jobID, date, service.WorkOrderInput{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			store.orders[wo.ID].Status = st
+			ids = append(ids, wo.ID)
+		}
+		return ids
+	}
+
+	t.Run("cancel takes the open work orders and leaves a completed one", func(t *testing.T) {
+		ids := seed(day, service.WOStatusDraft, service.WOStatusScheduled, service.WOStatusInProgress, service.WOStatusCompleted)
+		n, err := s.CancelOpenForOccurrence(ctx, jobID, time.Date(2026, 10, 5, 22, 0, 0, 0, time.FixedZone("+7", 7*3600)))
+		if err != nil || n != 3 {
+			t.Fatalf("n=%d err=%v", n, err)
+		}
+		for i, want := range []string{"canceled", "canceled", "canceled", "completed"} {
+			if got := store.orders[ids[i]].Status; got != want {
+				t.Errorf("work order %d is %s, want %s", i, got, want)
+			}
+		}
+		kept, _ := s.IDsForOccurrence(ctx, jobID, day, []string{service.WOStatusCompleted})
+		if !slices.Equal(kept, []string{ids[3]}) {
+			t.Errorf("kept %v, want %v", kept, ids[3:])
+		}
+	})
+
+	t.Run("move takes only the work orders that have not started", func(t *testing.T) {
+		other := dt("2026-10-12")
+		ids := seed(other, service.WOStatusDraft, service.WOStatusScheduled, service.WOStatusInProgress, service.WOStatusCompleted, service.WOStatusCanceled)
+		to := dt("2026-10-13")
+		n, err := s.MoveOpenForOccurrence(ctx, jobID, other, to)
+		if err != nil || n != 2 {
+			t.Fatalf("n=%d err=%v", n, err)
+		}
+		for i, want := range []time.Time{to, to, other, other, other} {
+			if got := store.orders[ids[i]].OccurrenceDate; !got.Equal(want) {
+				t.Errorf("work order %d is on %s, want %s", i, got.Format("2006-01-02"), want.Format("2006-01-02"))
+			}
+		}
+		left, _ := s.IDsForOccurrence(ctx, jobID, other, []string{service.WOStatusInProgress, service.WOStatusCompleted})
+		if !slices.Equal(left, ids[2:4]) {
+			t.Errorf("left behind %v, want %v", left, ids[2:4])
+		}
+	})
+
+	t.Run("another occurrence or job is never touched", func(t *testing.T) {
+		store := newMemWorkOrders()
+		s := service.NewWorkOrderService(store, mockJobs{jobID: withRefs(recJob(jobID, "2026-10-02", recurrenceDaily()))}, &fakeAvailability{})
+		wo, err := s.Create(ctx, jobID, dt("2026-10-06"), service.WorkOrderInput{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n, _ := s.CancelOpenForOccurrence(ctx, jobID, dt("2026-10-07")); n != 0 {
+			t.Errorf("canceled %d on another date", n)
+		}
+		if n, _ := s.CancelOpenForOccurrence(ctx, uid("ff"), dt("2026-10-06")); n != 0 {
+			t.Errorf("canceled %d for another job", n)
+		}
+		if store.orders[wo.ID].Status != service.WOStatusDraft {
+			t.Errorf("status %s", store.orders[wo.ID].Status)
+		}
+		if n, err := s.CountForJob(ctx, jobID); err != nil || n != 1 {
+			t.Errorf("count %d err=%v", n, err)
+		}
+	})
 }

@@ -66,13 +66,28 @@ type OccurrenceInvoices interface {
 	PaidIDsForOccurrence(ctx context.Context, jobID string, date time.Time) ([]string, error)
 }
 
+// OccurrenceWorkOrders handles the work orders of an occurrence that is
+// canceled, terminated or rescheduled. WorkOrderService satisfies it.
+type OccurrenceWorkOrders interface {
+	// CancelOpenForOccurrence cancels the draft, scheduled and in-progress work
+	// orders and returns how many it canceled.
+	CancelOpenForOccurrence(ctx context.Context, jobID string, date time.Time) (int64, error)
+	// MoveOpenForOccurrence moves the draft and scheduled work orders from one
+	// occurrence date to another and returns how many it moved.
+	MoveOpenForOccurrence(ctx context.Context, jobID string, from, to time.Time) (int64, error)
+	// IDsForOccurrence returns the work orders in one of statuses, which the
+	// change leaves as they are.
+	IDsForOccurrence(ctx context.Context, jobID string, date time.Time, statuses []string) ([]string, error)
+}
+
 type OccurrenceService struct {
-	jobs     JobGetter
-	occs     OccurrenceRepository
-	resolver *OccurrenceResolver
-	invoices OccurrenceInvoices
-	today    TodayProvider
-	now      func() time.Time
+	jobs       JobGetter
+	occs       OccurrenceRepository
+	resolver   *OccurrenceResolver
+	invoices   OccurrenceInvoices
+	workOrders OccurrenceWorkOrders
+	today      TodayProvider
+	now        func() time.Time
 }
 
 func NewOccurrenceService(jobs JobGetter, occs OccurrenceRepository, resolver *OccurrenceResolver) *OccurrenceService {
@@ -96,6 +111,14 @@ func (s *OccurrenceService) WithToday(t TodayProvider) *OccurrenceService {
 // depends on this one. Without it invoices are not touched.
 func (s *OccurrenceService) WithInvoices(invoices OccurrenceInvoices) *OccurrenceService {
 	s.invoices = invoices
+	return s
+}
+
+// WithWorkOrders makes canceling or terminating an occurrence cancel its open
+// work orders and rescheduling it move the ones that have not started to the
+// new date. Without it work orders are not touched.
+func (s *OccurrenceService) WithWorkOrders(workOrders OccurrenceWorkOrders) *OccurrenceService {
+	s.workOrders = workOrders
 	return s
 }
 
@@ -291,6 +314,17 @@ func (s *OccurrenceService) UpdateOccurrence(ctx context.Context, jobID string, 
 			}
 			saved.PaidInvoiceIDs = paid
 		}
+		if s.workOrders != nil && (req.Status == StatusCanceled || req.Status == StatusTerminateService) {
+			if _, err := s.workOrders.CancelOpenForOccurrence(ctx, jobID, date); err != nil {
+				return err
+			}
+			// A completed work order is left alone: the work was done.
+			kept, err := s.workOrders.IDsForOccurrence(ctx, jobID, date, []string{WOStatusCompleted})
+			if err != nil {
+				return err
+			}
+			saved.KeptWorkOrderIDs = kept
+		}
 		if req.Status == StatusRescheduled {
 			if err := s.occs.Create(ctx, &model.JobOccurrence{
 				JobID: jobID, OccurrenceDate: to, Status: StatusUnconfirmed, RescheduledFrom: &date,
@@ -308,6 +342,18 @@ func (s *OccurrenceService) UpdateOccurrence(ctx context.Context, jobID string, 
 					return err
 				}
 				saved.PaidInvoiceIDs = paid
+			}
+			// Work orders that have not started follow the visit; one that
+			// started or finished stays on the old date and is reported.
+			if s.workOrders != nil {
+				if _, err := s.workOrders.MoveOpenForOccurrence(ctx, jobID, date, to); err != nil {
+					return err
+				}
+				kept, err := s.workOrders.IDsForOccurrence(ctx, jobID, date, []string{WOStatusInProgress, WOStatusCompleted})
+				if err != nil {
+					return err
+				}
+				saved.KeptWorkOrderIDs = kept
 			}
 		}
 		return nil

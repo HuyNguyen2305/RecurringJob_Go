@@ -101,6 +101,22 @@ func SeedJob(t *testing.T, ctx context.Context, db *gorm.DB, job *model.Job) *mo
 	return job
 }
 
+// SeedWorkOrder inserts wo (and its tasks) into the tenant schema carried by
+// ctx. A work order without a customer, location and service type gets the
+// schema's shared set. Its status is stored as given, so a test can seed a
+// completed one directly (a completed one needs CompletedAt).
+func SeedWorkOrder(t *testing.T, ctx context.Context, db *gorm.DB, wo *model.WorkOrder) *model.WorkOrder {
+	t.Helper()
+	if wo.CustomerID == "" {
+		r := RefsFor(t, ctx, db)
+		wo.CustomerID, wo.LocationID, wo.ServiceTypeID = r.CustomerID, r.LocationID, r.ServiceTypeID
+	}
+	MustTx(t, ctx, db, func(tx *gorm.DB) error {
+		return tx.Omit("Customer", "Location", "ServiceType").Create(wo).Error
+	})
+	return wo
+}
+
 // SetRecurrence overwrites a job's recurrence directly, bypassing validation
 // (used to build states the API refuses, e.g. a cycle between two jobs).
 func SetRecurrence(t *testing.T, ctx context.Context, db *gorm.DB, jobID string, rule recurrence.Rule) {

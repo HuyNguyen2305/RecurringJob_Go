@@ -35,10 +35,10 @@ func NewServer(db *gorm.DB, defaultSchema string) *gin.Engine {
 	occSvc := service.NewOccurrenceService(jobRepo, occRepo, resolver).WithToday(settingsSvc)
 	invoiceSvc := service.NewInvoiceService(invoiceRepo, jobRepo, occSvc)
 	workOrderSvc := service.NewWorkOrderService(workOrderRepo, jobRepo, occSvc)
-	estimateSvc := service.NewEstimateService(estimateRepo, jobSvc, refs).WithToday(settingsSvc).WithInvoices(invoiceSvc).WithReopen(jobRepo, occRepo, invoiceSvc)
+	estimateSvc := service.NewEstimateService(estimateRepo, jobSvc, refs).WithToday(settingsSvc).WithInvoices(invoiceSvc).WithReopen(jobRepo, occRepo, invoiceSvc).WithWorkOrders(workOrderSvc)
 	// The invoice service needs the occurrence service (availability) and the
 	// occurrence service needs the invoice service (voiding), so one is set late.
-	occSvc.WithInvoices(invoiceSvc)
+	occSvc.WithInvoices(invoiceSvc).WithWorkOrders(workOrderSvc)
 
 	return router.New(defaultSchema, router.Handlers{
 		Settings:     handler.NewSettingsHandler(settingsSvc),

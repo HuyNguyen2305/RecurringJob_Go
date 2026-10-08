@@ -19,4 +19,9 @@ type JobOccurrence struct {
 	// occurrence was canceled or terminated and has paid invoices, which stay
 	// as they are, so the caller can follow up (for example a refund).
 	PaidInvoiceIDs []string `gorm:"-"`
+
+	// KeptWorkOrderIDs is not stored either. It lists the work orders a cancel,
+	// termination or reschedule left as they were: the completed ones, and on
+	// a reschedule also the in-progress ones, which stay on the old date.
+	KeptWorkOrderIDs []string `gorm:"-"`
 }
