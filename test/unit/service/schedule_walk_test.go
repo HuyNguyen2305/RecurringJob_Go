@@ -59,8 +59,8 @@ func TestWalkSchedule(t *testing.T) {
 			want: []brief{{"2026-10-01", service.StateReal, "unconfirmed"}, {"2026-10-02", service.StateHollow, "unconfirmed"}, {"2026-10-03", service.StateHollow, "unconfirmed"}},
 		},
 		{
-			name: "open past available occurrence is overdue and ends the walk", slots: slots, jobStatus: service.StatusUnconfirmed, today: "2026-10-05",
-			want: []brief{{"2026-10-01", service.StateOverdue, "unconfirmed"}}, ended: true,
+			name: "open past available occurrence is overdue; the visits after it stay listed but locked", slots: slots, jobStatus: service.StatusUnconfirmed, today: "2026-10-05",
+			want: []brief{{"2026-10-01", service.StateOverdue, "unconfirmed"}, {"2026-10-02", service.StateHollow, "unconfirmed"}, {"2026-10-03", service.StateHollow, "unconfirmed"}},
 		},
 		{
 			name: "completed makes the next real", slots: slots, jobStatus: service.StatusUnconfirmed, today: "2026-10-02",
@@ -128,8 +128,8 @@ func TestWalkScheduleMore(t *testing.T) {
 
 	t.Run("a rescheduled-to visit in the past is overdue", func(t *testing.T) {
 		items, ended := walk([]string{"2026-10-01", "2026-10-03"}, resched("2026-10-01", "2026-10-02"), service.StatusUnconfirmed, "2026-10-05")
-		want := []brief{{"2026-10-01", service.StateReal, "rescheduled"}, {"2026-10-02", service.StateOverdue, "unconfirmed"}}
-		if got := summarize(items); !reflect.DeepEqual(got, want) || !ended {
+		want := []brief{{"2026-10-01", service.StateReal, "rescheduled"}, {"2026-10-02", service.StateOverdue, "unconfirmed"}, {"2026-10-03", service.StateHollow, "unconfirmed"}}
+		if got := summarize(items); !reflect.DeepEqual(got, want) || ended {
 			t.Fatalf("got %v ended=%v", got, ended)
 		}
 	})
@@ -234,8 +234,11 @@ func TestWalkScheduleInvariants(t *testing.T) {
 		blocked := false
 		for idx, it := range items {
 			last := idx == len(items)-1
-			if (it.Status == service.StatusTerminateService || it.State == service.StateOverdue) && !last {
+			if it.Status == service.StatusTerminateService && !last {
 				t.Fatalf("case %d: item %d (%+v) must end the walk but %d items follow", i, idx, it, len(items)-1-idx)
+			}
+			if it.State == service.StateOverdue && !service.IsOpen(it.Status) {
+				t.Fatalf("case %d: item %d (%+v) is overdue but not open", i, idx, it)
 			}
 			wantState := service.StateReal
 			if blocked {
@@ -252,7 +255,7 @@ func TestWalkScheduleInvariants(t *testing.T) {
 			}
 		}
 		last := items[len(items)-1]
-		wantEnded := last.Status == service.StatusTerminateService || last.State == service.StateOverdue
+		wantEnded := last.Status == service.StatusTerminateService
 		if ended != wantEnded {
 			t.Fatalf("case %d: ended=%v but last item is %+v", i, ended, last)
 		}

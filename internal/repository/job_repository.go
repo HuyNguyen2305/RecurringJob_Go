@@ -63,6 +63,15 @@ func (r *JobRepository) Delete(ctx context.Context, id string) error {
 	})
 }
 
+// Count returns how many jobs the tenant has.
+func (r *JobRepository) Count(ctx context.Context) (int64, error) {
+	var n int64
+	err := r.WithSchema(ctx, func(tx *gorm.DB) error {
+		return tx.Model(&model.Job{}).Count(&n).Error
+	})
+	return n, err
+}
+
 // Create saves the job. Its customer, location and service type are read-only
 // and are not written.
 func (r *JobRepository) Create(ctx context.Context, job *model.Job) error {

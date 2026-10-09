@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -21,6 +22,15 @@ func newDraft(r helpers.Refs, notes string) *model.CustomerDocument {
 	return &model.CustomerDocument{
 		Status: "draft", CustomerID: r.CustomerID, LocationID: r.LocationID, ServiceTypeID: r.ServiceTypeID,
 		Notes: notes, LineItems: items("A", "B"),
+	}
+}
+
+// send moves a draft invoice to sent, which is what numbers it.
+func send(t *testing.T, ctx context.Context, invoices *repository.InvoiceRepository, id string) {
+	t.Helper()
+	n, err := invoices.UpdateStatusGuarded(ctx, id, []string{"draft"}, map[string]any{"status": "sent", "sent_at": time.Now().UTC()})
+	if err != nil || n != 1 {
+		t.Fatalf("send n=%d err=%v", n, err)
 	}
 }
 
@@ -49,13 +59,144 @@ func TestDocumentNumbers(t *testing.T) {
 			}
 			got = append(got, e.Number)
 		}
+		// An invoice is numbered when it is sent, not when it is created.
 		inv := newInvoice(r, job.ID, civil.New(2026, 10, 5))
 		if err := invoices.Create(ctx, inv); err != nil {
 			t.Fatal(err)
 		}
-		got = append(got, inv.Number)
+		if inv.Number != "" {
+			t.Fatalf("a draft invoice got the number %q", inv.Number)
+		}
+		send(t, ctx, invoices, inv.ID)
+		sent, err := invoices.Get(ctx, inv.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, sent.Number)
 		if want := []string{"EST-000001", "EST-000002", "EST-000003", "INV-000001"}; strings.Join(got, ",") != strings.Join(want, ",") {
 			t.Fatalf("numbers %v, want %v", got, want)
+		}
+	})
+
+	t.Run("invoice numbers have no gaps: failed creates, deleted drafts and failed sends use none", func(t *testing.T) {
+		db, ctx := helpers.NewTestDB(t)
+		r := helpers.RefsFor(t, ctx, db)
+		invoices := repository.NewInvoiceRepository(db)
+		job := helpers.SeedJob(t, ctx, db, fixtures.DailyJob(civil.New(2026, 10, 1)))
+		day := func(n int) time.Time { return civil.New(2026, 10, n) }
+		create := func(n int) *model.CustomerDocument {
+			t.Helper()
+			inv := newInvoice(r, job.ID, day(n))
+			if err := invoices.Create(ctx, inv); err != nil {
+				t.Fatal(err)
+			}
+			return inv
+		}
+		numberOf := func(inv *model.CustomerDocument) string {
+			t.Helper()
+			got, err := invoices.Get(ctx, inv.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return got.Number
+		}
+
+		a, b, c := create(2), create(3), create(4)
+		if err := invoices.Create(ctx, newInvoice(r, job.ID, day(2))); appStatus(t, err) != 409 { // a second live invoice for the day
+			t.Fatalf("duplicate: %v", err)
+		}
+		if n, err := invoices.DeleteGuarded(ctx, b.ID, []string{"draft"}); err != nil || n != 1 {
+			t.Fatalf("delete n=%d err=%v", n, err)
+		}
+		send(t, ctx, invoices, c.ID) // sent before a, so it is the first
+		send(t, ctx, invoices, a.ID)
+		if numberOf(c) != "INV-000001" || numberOf(a) != "INV-000002" {
+			t.Fatalf("numbers %s then %s: they follow the order of sending, with no hole", numberOf(c), numberOf(a))
+		}
+
+		// A send that fails after taking its number gives it back.
+		d := create(5)
+		clash := create(6)
+		send(t, ctx, invoices, clash.ID)
+		if _, err := invoices.UpdateStatusGuarded(ctx, d.ID, []string{"draft"}, map[string]any{"status": "sent", "occurrence_date": day(6)}); err == nil {
+			t.Fatal("expected the one-live-invoice index to refuse the send")
+		}
+		send(t, ctx, invoices, d.ID)
+		if numberOf(clash) != "INV-000003" || numberOf(d) != "INV-000004" {
+			t.Fatalf("numbers %s then %s", numberOf(clash), numberOf(d))
+		}
+	})
+
+	t.Run("a draft or a voided draft has no number; sending numbers it once", func(t *testing.T) {
+		db, ctx := helpers.NewTestDB(t)
+		r := helpers.RefsFor(t, ctx, db)
+		invoices := repository.NewInvoiceRepository(db)
+		job := helpers.SeedJob(t, ctx, db, fixtures.DailyJob(civil.New(2026, 10, 1)))
+		voided := newInvoice(r, job.ID, civil.New(2026, 10, 2))
+		sent := newInvoice(r, job.ID, civil.New(2026, 10, 3))
+		for _, inv := range []*model.CustomerDocument{voided, sent} {
+			if err := invoices.Create(ctx, inv); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if n := helpers.Scalar(t, ctx, db, `SELECT count(*) FROM customer_documents WHERE type = 'invoice' AND number IS NULL`); n != 2 {
+			t.Fatalf("%d numberless draft invoices, want 2", n)
+		}
+		if n, err := invoices.UpdateStatusGuarded(ctx, voided.ID, []string{"draft"}, map[string]any{"status": "void"}); err != nil || n != 1 {
+			t.Fatalf("void n=%d err=%v", n, err)
+		}
+		send(t, ctx, invoices, sent.ID)
+		if got, _ := invoices.Get(ctx, voided.ID); got.Number != "" {
+			t.Errorf("a voided draft has the number %q", got.Number)
+		}
+		if got, _ := invoices.Get(ctx, sent.ID); got.Number != "INV-000001" {
+			t.Errorf("the sent invoice has the number %q", got.Number)
+		}
+		// Voiding a sent invoice keeps its number.
+		if n, err := invoices.UpdateStatusGuarded(ctx, sent.ID, []string{"sent"}, map[string]any{"status": "void"}); err != nil || n != 1 {
+			t.Fatalf("void sent n=%d err=%v", n, err)
+		}
+		if got, _ := invoices.Get(ctx, sent.ID); got.Number != "INV-000001" || got.Status != "void" {
+			t.Errorf("got %+v", got)
+		}
+	})
+
+	t.Run("concurrent sends get distinct, consecutive numbers", func(t *testing.T) {
+		db, ctx := helpers.NewTestDB(t)
+		r := helpers.RefsFor(t, ctx, db)
+		invoices := repository.NewInvoiceRepository(db)
+		job := helpers.SeedJob(t, ctx, db, fixtures.DailyJob(civil.New(2026, 10, 1)))
+		const total = 12
+		ids := make([]string, total)
+		for i := range ids {
+			inv := newInvoice(r, job.ID, civil.New(2026, 10, 2+i))
+			if err := invoices.Create(ctx, inv); err != nil {
+				t.Fatal(err)
+			}
+			ids[i] = inv.ID
+		}
+		var wg sync.WaitGroup
+		for _, id := range ids {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				if n, err := invoices.UpdateStatusGuarded(ctx, id, []string{"draft"}, map[string]any{"status": "sent"}); err != nil || n != 1 {
+					t.Errorf("send n=%d err=%v", n, err)
+				}
+			}()
+		}
+		wg.Wait()
+		var numbers []string
+		helpers.MustTx(t, ctx, db, func(tx *gorm.DB) error {
+			return tx.Raw(`SELECT number FROM customer_documents WHERE type = 'invoice' ORDER BY number`).Scan(&numbers).Error
+		})
+		if len(numbers) != total {
+			t.Fatalf("%d numbers, want %d: %v", len(numbers), total, numbers)
+		}
+		for i, got := range numbers {
+			if want := fmt.Sprintf("INV-%06d", i+1); got != want {
+				t.Fatalf("numbers %v: position %d is %s, want %s", numbers, i, got, want)
+			}
 		}
 	})
 
@@ -267,6 +408,13 @@ func TestDocumentListFiltersInTheDatabase(t *testing.T) {
 		if err := invoices.Create(ctx, inv); err != nil {
 			t.Fatal(err)
 		}
+	}
+	// Only a sent invoice has a number to search by.
+	send(t, ctx, invoices, inv9.ID)
+	if sent, err := invoices.Get(ctx, inv9.ID); err != nil || sent.Number == "" {
+		t.Fatalf("sent invoice: %+v err=%v", sent, err)
+	} else {
+		inv9.Number = sent.Number
 	}
 
 	ids := func(list []model.CustomerDocument) string {

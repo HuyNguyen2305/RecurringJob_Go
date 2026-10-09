@@ -78,15 +78,38 @@ type WorkOrderListQuery struct {
 	Offset         int
 }
 
+// OccurrenceOpenness is the occurrence check a work order needs before it
+// attaches to an occurrence: the occurrence must be available and still open
+// (a completed visit takes no new work orders). OccurrenceService.OpenFor
+// satisfies it.
+type OccurrenceOpenness interface {
+	OpenFor(ctx context.Context, jobID string, date time.Time) error
+}
+
 // WorkOrderService holds the work order business rules.
 type WorkOrderService struct {
 	orders WorkOrderStore
 	jobs   JobGetter
-	occs   OccurrenceAvailability
+	occs   OccurrenceOpenness
+	today  TodayProvider
+	now    func() time.Time
 }
 
-func NewWorkOrderService(orders WorkOrderStore, jobs JobGetter, occs OccurrenceAvailability) *WorkOrderService {
-	return &WorkOrderService{orders: orders, jobs: jobs, occs: occs}
+func NewWorkOrderService(orders WorkOrderStore, jobs JobGetter, occs OccurrenceOpenness) *WorkOrderService {
+	return &WorkOrderService{orders: orders, jobs: jobs, occs: occs, now: time.Now}
+}
+
+// WithClock replaces the clock used to decide what "today" is and when a work
+// order was completed (for tests).
+func (s *WorkOrderService) WithClock(now func() time.Time) *WorkOrderService {
+	s.now = now
+	return s
+}
+
+// WithToday makes "today" the tenant's calendar date instead of the UTC one.
+func (s *WorkOrderService) WithToday(t TodayProvider) *WorkOrderService {
+	s.today = t
+	return s
 }
 
 func buildTasks(in []TaskInput) ([]model.WorkOrderTask, error) {
@@ -131,7 +154,7 @@ func (s *WorkOrderService) Create(ctx context.Context, jobID string, date time.T
 		if err := s.orders.LockOccurrence(ctx, jobID, date); err != nil {
 			return err
 		}
-		if err := s.occs.AvailableFor(ctx, jobID, date); err != nil {
+		if err := s.occs.OpenFor(ctx, jobID, date); err != nil {
 			return err
 		}
 		job, err := s.jobs.GetJob(ctx, jobID)
@@ -244,7 +267,9 @@ func (s *WorkOrderService) Update(ctx context.Context, id string, p WorkOrderPat
 }
 
 // ChangeStatus moves the work order to a new status if the transition is
-// allowed. Completing needs at least one task, all of them done.
+// allowed. Completing needs at least one task, all of them done. Like an
+// occurrence, a work order cannot be started or completed before its visit
+// date (409); scheduling and canceling are fine at any time.
 func (s *WorkOrderService) ChangeStatus(ctx context.Context, id, to string) (*model.WorkOrder, error) {
 	if err := ValidateID("work order id", id); err != nil {
 		return nil, err
@@ -263,6 +288,19 @@ func (s *WorkOrderService) ChangeStatus(ctx context.Context, id, to string) (*mo
 		if to == WOStatusScheduled && len(wo.Tasks) == 0 {
 			return apperror.Validation("add at least one task before scheduling")
 		}
+		if to == WOStatusInProgress || to == WOStatusCompleted {
+			today, err := currentDate(ctx, s.today, s.now)
+			if err != nil {
+				return err
+			}
+			if civil.Truncate(wo.OccurrenceDate).After(today) {
+				verb := "started"
+				if to == WOStatusCompleted {
+					verb = "completed"
+				}
+				return apperror.Conflict("a work order cannot be " + verb + " before its visit date, " + civil.Format(wo.OccurrenceDate))
+			}
+		}
 		if to == WOStatusCompleted {
 			if len(wo.Tasks) == 0 {
 				return apperror.Validation("add at least one task before completing")
@@ -275,7 +313,7 @@ func (s *WorkOrderService) ChangeStatus(ctx context.Context, id, to string) (*mo
 		}
 		updates := map[string]any{"status": to}
 		if to == WOStatusCompleted {
-			updates["completed_at"] = time.Now().UTC()
+			updates["completed_at"] = s.now().UTC()
 		}
 		n, err := s.orders.UpdateStatusGuarded(ctx, id, WorkOrderAllowedFrom(to), updates)
 		if err != nil {

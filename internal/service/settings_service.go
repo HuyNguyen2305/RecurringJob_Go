@@ -24,14 +24,27 @@ type TodayProvider interface {
 	Today(ctx context.Context) (time.Time, error)
 }
 
+// JobCounter counts the tenant's jobs. JobRepository satisfies it.
+type JobCounter interface {
+	Count(ctx context.Context) (int64, error)
+}
+
 // SettingsService manages per-tenant settings and answers "what is today".
 type SettingsService struct {
 	store SettingsStore
+	jobs  JobCounter
 	now   func() time.Time
 }
 
 func NewSettingsService(store SettingsStore) *SettingsService {
 	return &SettingsService{store: store, now: time.Now}
+}
+
+// WithJobs makes UpdateTimezone refuse a different zone once the tenant has a
+// job. Without it the zone can always change.
+func (s *SettingsService) WithJobs(jobs JobCounter) *SettingsService {
+	s.jobs = jobs
+	return s
 }
 
 // WithClock replaces the clock (for tests).
@@ -45,7 +58,10 @@ func (s *SettingsService) Get(ctx context.Context) (*model.TenantSettings, error
 	return s.store.Get(ctx)
 }
 
-// UpdateTimezone validates and saves the tenant's IANA time zone.
+// UpdateTimezone validates and saves the tenant's IANA time zone. "Today"
+// follows the zone, so changing it once the tenant has jobs would silently
+// reinterpret which visits are overdue, due or in the future: that is a 409.
+// Saving the zone the tenant already has is always fine.
 func (s *SettingsService) UpdateTimezone(ctx context.Context, tz string) (*model.TenantSettings, error) {
 	if tz == "" {
 		return nil, apperror.Validation("timezone is required")
@@ -59,6 +75,21 @@ func (s *SettingsService) UpdateTimezone(ctx context.Context, tz string) (*model
 	}
 	if _, err := time.LoadLocation(tz); err != nil {
 		return nil, apperror.Validation("unknown timezone " + tz + "; use an IANA name such as America/Los_Angeles")
+	}
+	if s.jobs != nil {
+		current, err := s.store.Get(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if current.Timezone != tz {
+			n, err := s.jobs.Count(ctx)
+			if err != nil {
+				return nil, err
+			}
+			if n > 0 {
+				return nil, apperror.Conflict("the timezone cannot change once the tenant has jobs")
+			}
+		}
 	}
 	return s.store.SetTimezone(ctx, tz)
 }

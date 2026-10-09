@@ -75,6 +75,67 @@ func TestSettingsUpdateTimezone(t *testing.T) {
 	})
 }
 
+// fakeJobCounter says how many jobs the tenant has.
+type fakeJobCounter struct {
+	n   int64
+	err error
+}
+
+func (f fakeJobCounter) Count(context.Context) (int64, error) { return f.n, f.err }
+
+func TestSettingsTimezoneIsLockedOnceThereAreJobs(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("a different zone is refused when the tenant has jobs, and nothing is saved", func(t *testing.T) {
+		store := &fakeSettings{tz: "UTC"}
+		s := service.NewSettingsService(store).WithJobs(fakeJobCounter{n: 1})
+		if _, err := s.UpdateTimezone(ctx, "Asia/Kolkata"); statusOf(t, err) != 409 || len(store.saved) != 0 {
+			t.Fatalf("err=%v saved=%v", err, store.saved)
+		}
+	})
+
+	t.Run("saving the zone the tenant already has is fine", func(t *testing.T) {
+		store := &fakeSettings{tz: "Asia/Kolkata"}
+		s := service.NewSettingsService(store).WithJobs(fakeJobCounter{n: 5})
+		if got, err := s.UpdateTimezone(ctx, "Asia/Kolkata"); err != nil || got.Timezone != "Asia/Kolkata" {
+			t.Fatalf("got %+v err=%v", got, err)
+		}
+	})
+
+	t.Run("with no jobs the zone can change freely", func(t *testing.T) {
+		store := &fakeSettings{tz: "UTC"}
+		s := service.NewSettingsService(store).WithJobs(fakeJobCounter{})
+		if _, err := s.UpdateTimezone(ctx, "Asia/Kolkata"); err != nil || len(store.saved) != 1 {
+			t.Fatalf("err=%v saved=%v", err, store.saved)
+		}
+	})
+
+	t.Run("a bad zone is a 400 before the jobs are even counted", func(t *testing.T) {
+		boom := errors.New("boom")
+		s := service.NewSettingsService(&fakeSettings{tz: "UTC"}).WithJobs(fakeJobCounter{err: boom})
+		if _, err := s.UpdateTimezone(ctx, "Mars/Base"); statusOf(t, err) != 400 {
+			t.Fatalf("got %v", err)
+		}
+	})
+
+	t.Run("store and count failures propagate", func(t *testing.T) {
+		boom := errors.New("boom")
+		if _, err := service.NewSettingsService(&fakeSettings{tz: "UTC", getErr: boom}).WithJobs(fakeJobCounter{}).UpdateTimezone(ctx, "Asia/Kolkata"); !errors.Is(err, boom) {
+			t.Errorf("get: %v", err)
+		}
+		if _, err := service.NewSettingsService(&fakeSettings{tz: "UTC"}).WithJobs(fakeJobCounter{err: boom}).UpdateTimezone(ctx, "Asia/Kolkata"); !errors.Is(err, boom) {
+			t.Errorf("count: %v", err)
+		}
+	})
+
+	t.Run("without the job counter the zone can always change", func(t *testing.T) {
+		store := &fakeSettings{tz: "UTC"}
+		if _, err := service.NewSettingsService(store).UpdateTimezone(ctx, "Asia/Kolkata"); err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
 func TestSettingsToday(t *testing.T) {
 	ctx := context.Background()
 	at := func(s string) func() time.Time {

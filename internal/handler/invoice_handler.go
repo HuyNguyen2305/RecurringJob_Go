@@ -30,7 +30,7 @@ func NewInvoiceHandler(invoices InvoiceService) *InvoiceHandler {
 }
 
 // Create godoc
-// @Summary  Create a draft invoice for one occurrence of a job
+// @Summary  Create a draft invoice for one occurrence of a job (omit lineItems to start from the job's estimate)
 // @Tags     invoices
 // @Accept   json
 // @Produce  json
@@ -53,7 +53,11 @@ func (h *InvoiceHandler) Create(c *gin.Context) {
 		fail(c, apperror.Validation(err.Error()))
 		return
 	}
-	doc, err := h.invoices.Create(c.Request.Context(), c.Param("id"), date, toDocumentInput(req.Notes, req.LineItems))
+	in := toDocumentInput(req.Notes, req.LineItems)
+	if req.LineItems == nil {
+		in.LineItems = nil // omitted, as opposed to an explicit empty list: the service may prefill
+	}
+	doc, err := h.invoices.Create(c.Request.Context(), c.Param("id"), date, in)
 	if err != nil {
 		fail(c, err)
 		return

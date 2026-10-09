@@ -29,12 +29,12 @@ func NewServer(db *gorm.DB, defaultSchema string) *gin.Engine {
 	refs := service.NewReferences(customerRepo, locationRepo, serviceTypeRepo)
 	customerSvc := service.NewCustomerService(customerRepo, locationRepo)
 	serviceTypeSvc := service.NewServiceTypeService(serviceTypeRepo)
-	settingsSvc := service.NewSettingsService(settingsRepo)
+	settingsSvc := service.NewSettingsService(settingsRepo).WithJobs(jobRepo)
 	resolver := service.NewOccurrenceResolver(jobRepo)
 	jobSvc := service.NewJobService(jobRepo, resolver, refs)
 	occSvc := service.NewOccurrenceService(jobRepo, occRepo, resolver).WithToday(settingsSvc)
-	invoiceSvc := service.NewInvoiceService(invoiceRepo, jobRepo, occSvc)
-	workOrderSvc := service.NewWorkOrderService(workOrderRepo, jobRepo, occSvc)
+	invoiceSvc := service.NewInvoiceService(invoiceRepo, jobRepo, occSvc).WithEstimates(estimateRepo)
+	workOrderSvc := service.NewWorkOrderService(workOrderRepo, jobRepo, occSvc).WithToday(settingsSvc)
 	estimateSvc := service.NewEstimateService(estimateRepo, jobSvc, refs).WithToday(settingsSvc).WithInvoices(invoiceSvc).WithReopen(jobRepo, occRepo, invoiceSvc).WithWorkOrders(workOrderSvc)
 	// The invoice service needs the occurrence service (availability) and the
 	// occurrence service needs the invoice service (voiding), so one is set late.

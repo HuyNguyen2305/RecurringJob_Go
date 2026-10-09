@@ -66,8 +66,9 @@ type LineItemResponse struct {
 
 // DocumentResponse is an estimate or invoice as returned by the API.
 type DocumentResponse struct {
-	ID             string               `json:"id"`
-	Number         string               `json:"number"`
+	ID string `json:"id"`
+	// Number is null for a draft invoice: an invoice is numbered when it is sent.
+	Number         *string              `json:"number"`
 	Type           string               `json:"type"`
 	Status         string               `json:"status"`
 	Customer       *CustomerResponse    `json:"customer"`
@@ -97,7 +98,7 @@ func NewDocumentResponse(d *model.CustomerDocument) DocumentResponse {
 		})
 	}
 	out := DocumentResponse{
-		ID: d.ID, Number: d.Number, Type: d.Type, Status: d.Status, Notes: d.Notes, Revision: d.Revision,
+		ID: d.ID, Number: numberOrNil(d.Number), Type: d.Type, Status: d.Status, Notes: d.Notes, Revision: d.Revision,
 		SentAt: utcTime(d.SentAt), PaidAt: utcTime(d.PaidAt), RefundedAt: utcTime(d.RefundedAt),
 		JobID: d.JobID, JobSnapshot: d.JobSnapshot, OccurrenceDate: fmtDate(d.OccurrenceDate),
 		LineItems: items, SubtotalCents: d.TotalCents(), TotalCents: d.TotalCents(),
@@ -125,6 +126,14 @@ func NewDocumentResponses(docs []model.CustomerDocument) []DocumentResponse {
 		out = append(out, NewDocumentResponse(&docs[i]))
 	}
 	return out
+}
+
+// numberOrNil is the document number, or nil when it has none yet.
+func numberOrNil(n string) *string {
+	if n == "" {
+		return nil
+	}
+	return &n
 }
 
 func utcTime(t *time.Time) *time.Time {

@@ -46,6 +46,17 @@ func (r *EstimateRepository) MarkReopened(ctx context.Context, id string, allowe
 	})
 }
 
+// LineItemsForJob returns the line items of the job's estimate in position
+// order; empty (never nil) when the job has no estimate.
+func (r *EstimateRepository) LineItemsForJob(ctx context.Context, jobID string) ([]model.CustomerLineItem, error) {
+	items := []model.CustomerLineItem{}
+	err := r.WithSchema(ctx, func(tx *gorm.DB) error {
+		estimates := tx.Model(&model.CustomerDocument{}).Select("id").Where("type = ? AND job_id = ?", r.docType, jobID)
+		return tx.Where("parent_id IN (?)", estimates).Order("position").Find(&items).Error
+	})
+	return items, err
+}
+
 // SaveRevision stores the estimate's current content as the given revision.
 func (r *EstimateRepository) SaveRevision(ctx context.Context, rev *model.DocumentRevision) error {
 	return r.WithSchema(ctx, func(tx *gorm.DB) error { return tx.Create(rev).Error })

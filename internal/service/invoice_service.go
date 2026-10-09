@@ -36,13 +36,20 @@ type InvoiceStore interface {
 	LockOccurrence(ctx context.Context, jobID string, date time.Time) error
 }
 
+// EstimateLines gives the line items of a job's estimate, which a new invoice
+// starts from. EstimateRepository satisfies it.
+type EstimateLines interface {
+	LineItemsForJob(ctx context.Context, jobID string) ([]model.CustomerLineItem, error)
+}
+
 // InvoiceService holds the invoice business rules. Get, List, Update and
 // ChangeStatus come from the shared documentCore.
 type InvoiceService struct {
 	*documentCore
-	invoices InvoiceStore
-	jobs     JobGetter
-	occs     OccurrenceAvailability
+	invoices  InvoiceStore
+	jobs      JobGetter
+	occs      OccurrenceAvailability
+	estimates EstimateLines
 }
 
 func NewInvoiceService(invoices InvoiceStore, jobs JobGetter, occs OccurrenceAvailability) *InvoiceService {
@@ -52,6 +59,13 @@ func NewInvoiceService(invoices InvoiceStore, jobs JobGetter, occs OccurrenceAva
 		jobs:         jobs,
 		occs:         occs,
 	}
+}
+
+// WithEstimates makes an invoice created without line items start from the
+// lines of its job's estimate. Without it such an invoice starts empty.
+func (s *InvoiceService) WithEstimates(estimates EstimateLines) *InvoiceService {
+	s.estimates = estimates
+	return s
 }
 
 // VoidUnpaidForOccurrence voids the occurrence's draft and sent invoices, for
@@ -75,15 +89,25 @@ func (s *InvoiceService) PaidIDsForOccurrence(ctx context.Context, jobID string,
 	return s.invoices.IDsForOccurrence(ctx, jobID, civil.Truncate(date), DocStatusPaid)
 }
 
-// HasPaidForJob reports whether any invoice of the job is paid.
+// HasPaidForJob reports whether any invoice of the job was ever paid: it is
+// paid now, or it was paid and then refunded. A refund does not undo the fact
+// that the job was billed and paid.
 func (s *InvoiceService) HasPaidForJob(ctx context.Context, jobID string) (bool, error) {
-	return s.invoices.ExistsForJob(ctx, jobID, DocStatusPaid)
+	for _, status := range []string{DocStatusPaid, DocStatusRefunded} {
+		found, err := s.invoices.ExistsForJob(ctx, jobID, status)
+		if err != nil || found {
+			return found, err
+		}
+	}
+	return false, nil
 }
 
 // Create saves a draft invoice for one occurrence of a job. The occurrence
 // must exist and be available (404 / 409 otherwise); a second live invoice for
 // the same occurrence is a 409 (a voided one does not count). The job is
-// snapshotted onto the invoice.
+// snapshotted onto the invoice. When the input has no line items at all (nil,
+// as opposed to an explicit empty list) the invoice starts with the lines of
+// the job's estimate, if it has one.
 func (s *InvoiceService) Create(ctx context.Context, jobID string, date time.Time, in DocumentInput) (*model.CustomerDocument, error) {
 	if err := ValidateID("job id", jobID); err != nil {
 		return nil, err
@@ -113,6 +137,17 @@ func (s *InvoiceService) Create(ctx context.Context, jobID string, date time.Tim
 		doc.JobID = &job.ID
 		doc.JobSnapshot = snapshotOf(job)
 		doc.OccurrenceDate = &date
+		if in.LineItems == nil && s.estimates != nil {
+			lines, err := s.estimates.LineItemsForJob(ctx, job.ID)
+			if err != nil {
+				return err
+			}
+			for i, l := range lines {
+				doc.LineItems = append(doc.LineItems, model.CustomerLineItem{
+					Position: i, Description: l.Description, Quantity: l.Quantity, UnitPriceCents: l.UnitPriceCents,
+				})
+			}
+		}
 		return s.invoices.Create(ctx, doc)
 	})
 	if err != nil {

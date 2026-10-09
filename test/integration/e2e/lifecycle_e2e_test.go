@@ -49,11 +49,12 @@ func TestE2ENumbersAndTimestamps(t *testing.T) {
 
 	job := c.post("/estimates/"+id+"/approve", fmt.Sprintf(`{"date":%q,"recurrence":{"frequency":"daily"}}`, today)).expect(t, 200).obj()["jobId"].(string)
 	inv := c.post("/jobs/"+job+"/occurrences/"+today+"/invoice", draftBody).expect(t, 200).obj()
-	if inv["number"] != "INV-000001" || inv["sentAt"] != nil {
+	// A draft invoice has no number yet: it is numbered when it is sent.
+	if inv["number"] != nil || inv["sentAt"] != nil {
 		t.Fatalf("invoice: %v", inv)
 	}
 	invID := inv["id"].(string)
-	if got := c.patch("/invoices/"+invID+"/status", `{"status":"sent"}`).expect(t, 200).obj(); got["sentAt"] == nil || got["paidAt"] != nil {
+	if got := c.patch("/invoices/"+invID+"/status", `{"status":"sent"}`).expect(t, 200).obj(); got["sentAt"] == nil || got["paidAt"] != nil || got["number"] != "INV-000001" {
 		t.Fatalf("sent invoice: %v", got)
 	}
 	paid := c.patch("/invoices/"+invID+"/status", `{"status":"paid"}`).expect(t, 200).obj()
@@ -127,14 +128,14 @@ func TestE2ERefund(t *testing.T) {
 		}
 	})
 
-	t.Run("a refund opens a one-off estimate for edits again", func(t *testing.T) {
+	t.Run("a refund does not open a one-off estimate for edits again", func(t *testing.T) {
 		c, _, _ := newClient(t)
 		est, job := approvedEstimate(t, c)
 		inv := invoiceFor(t, c, job, civil.Format(civil.Today()))
 		pay(c, inv)
 		c.patch("/estimates/"+est, `{"notes":"locked"}`).expect(t, 409)
 		c.patch("/invoices/"+inv+"/status", `{"status":"refunded"}`).expect(t, 200)
-		c.patch("/estimates/"+est, `{"notes":"open again"}`).expect(t, 200)
+		c.patch("/estimates/"+est, `{"notes":"still locked"}`).expect(t, 409) // the job was billed and paid
 	})
 }
 
@@ -385,7 +386,10 @@ func TestE2EListFilters(t *testing.T) {
 		only(t, ids(c.get(q("/invoices", "occurrenceFrom", today, "occurrenceTo", today))), a, b)
 		only(t, ids(c.get(q("/invoices", "jobId", other, "occurrenceFrom", today, "occurrenceTo", today))), b)
 		only(t, ids(c.get(q("/invoices", "q", "lovelace"))), a, b, d)
-		only(t, ids(c.get(q("/invoices", "q", "INV-000002"))), b)
+		// Only a sent invoice has a number to search for.
+		sentB := c.patch("/invoices/"+b+"/status", `{"status":"sent"}`).expect(t, 200).obj()["number"].(string)
+		only(t, ids(c.get(q("/invoices", "q", sentB))), b)
+		only(t, ids(c.get(q("/invoices", "q", "INV-"))), b)
 		only(t, ids(c.get(q("/invoices", "customerId", bob))))
 	})
 

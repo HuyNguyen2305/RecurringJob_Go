@@ -203,8 +203,13 @@ func TestE2EOverdueGating(t *testing.T) {
 
 	id, _ := c.post("/jobs", fmt.Sprintf(`{"date":%q,"recurrence":{"frequency":"daily"}}`, day(-2))).expect(t, 200).obj()["id"].(string)
 	items := c.get("/jobs/"+id+"/schedule").expect(t, 200).list()
-	if len(items) != 1 || items[0].(map[string]any)["state"] != "overdue" {
-		t.Fatalf("an overdue first occurrence must be the only item: %v", items)
+	if len(items) < 3 || items[0].(map[string]any)["state"] != "overdue" || items[0].(map[string]any)["date"] != day(-2) {
+		t.Fatalf("an overdue first occurrence must come first: %v", items)
+	}
+	for i, it := range items[1:] {
+		if it.(map[string]any)["state"] != "hollow" {
+			t.Fatalf("item %d after the overdue one must be listed but locked (hollow): %v", i+1, it)
+		}
 	}
 	c.patch("/jobs/"+id+"/occurrences/"+day(-1), `{"status":"completed"}`).expect(t, 409)
 	c.patch("/jobs/"+id+"/occurrences/"+day(-2), `{"status":"completed"}`).expect(t, 200)

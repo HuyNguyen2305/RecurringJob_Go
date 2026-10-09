@@ -44,7 +44,8 @@ func fmtPtr(t *time.Time) *string {
 
 // WalkSchedule walks the generated slots in order, gating each on the one
 // before it. It returns the visits emitted and whether the series ended
-// (terminate_service, or an overdue open occurrence that blocks the rest).
+// (terminate_service). An overdue open occurrence does not end it: the visits
+// after it are still listed, as hollow, and stay locked until it is resolved.
 func WalkSchedule(slots []string, rows map[string]model.JobOccurrence, jobStatus, jobDate string, today time.Time) ([]ScheduleItem, bool) {
 	items := []ScheduleItem{}
 	available := true
@@ -85,10 +86,11 @@ func WalkSchedule(slots []string, rows map[string]model.JobOccurrence, jobStatus
 				items = append(items, item)
 				available = true
 			default: // open
+				// An open visit in the past that is due blocks the ones after
+				// it, which stay listed but locked (hollow) until it is resolved.
 				d, _ := civil.Parse(cur)
 				if available && d.Before(today) {
 					item.State = StateOverdue
-					return append(items, item), true
 				}
 				items = append(items, item)
 				available = false

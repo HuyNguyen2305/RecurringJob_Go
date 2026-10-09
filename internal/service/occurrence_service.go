@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"recurringjob/internal/common/apperror"
@@ -199,22 +200,43 @@ func (s *OccurrenceService) ValidOccurrenceDate(ctx context.Context, jobID strin
 // AvailableFor returns nil when something can attach to the occurrence: it
 // must be valid, not canceled/rescheduled/terminated, and not hollow (409).
 func (s *OccurrenceService) AvailableFor(ctx context.Context, jobID string, date time.Time) error {
-	job, rows, err := s.load(ctx, jobID)
+	_, err := s.available(ctx, jobID, date)
+	return err
+}
+
+// OpenFor is AvailableFor that also refuses a completed occurrence (409): a
+// finished visit takes no new work orders. Invoices use AvailableFor, because
+// a completed visit is still billed.
+func (s *OccurrenceService) OpenFor(ctx context.Context, jobID string, date time.Time) error {
+	view, err := s.available(ctx, jobID, date)
 	if err != nil {
 		return err
+	}
+	if view.status == StatusCompleted {
+		return apperror.Conflict("occurrence is " + view.status)
+	}
+	return nil
+}
+
+// available returns the occurrence's view once it is known to be valid, not
+// canceled/rescheduled/terminated, and not hollow.
+func (s *OccurrenceService) available(ctx context.Context, jobID string, date time.Time) (*occurrenceView, error) {
+	job, rows, err := s.load(ctx, jobID)
+	if err != nil {
+		return nil, err
 	}
 	view, err := s.locate(ctx, job, rows, civil.Truncate(date))
 	if err != nil {
-		return err
+		return nil, err
 	}
 	switch view.status {
 	case StatusCanceled, StatusRescheduled, StatusTerminateService:
-		return apperror.Conflict("occurrence is " + view.status)
+		return nil, apperror.Conflict("occurrence is " + view.status)
 	}
 	if !view.available {
-		return apperror.Conflict("occurrence is not available yet: an earlier occurrence is still open")
+		return nil, apperror.Conflict("occurrence is not available yet: an earlier occurrence is still open")
 	}
-	return nil
+	return view, nil
 }
 
 // UpdateOccurrence changes the status of one occurrence (PATCH).
@@ -293,6 +315,17 @@ func (s *OccurrenceService) UpdateOccurrence(ctx context.Context, jobID string, 
 		if err := s.occs.LockOccurrence(ctx, jobID, date); err != nil {
 			return err
 		}
+		// A finished visit cannot leave work behind it. A work order is
+		// created under this same lock, so none can slip in after the check.
+		if s.workOrders != nil && req.Status == StatusCompleted {
+			open, err := s.workOrders.IDsForOccurrence(ctx, jobID, date, openWorkOrderStatuses)
+			if err != nil {
+				return err
+			}
+			if len(open) > 0 {
+				return apperror.Conflict("the occurrence still has open work orders (" + strings.Join(open, ", ") + "); complete or cancel them first")
+			}
+		}
 		if view.row != nil {
 			n, err := s.occs.UpdateGuarded(ctx, view.row.ID, AllowedFrom(req.Status), updates)
 			if err != nil {
@@ -327,7 +360,9 @@ func (s *OccurrenceService) UpdateOccurrence(ctx context.Context, jobID string, 
 		}
 		if req.Status == StatusRescheduled {
 			if err := s.occs.Create(ctx, &model.JobOccurrence{
-				JobID: jobID, OccurrenceDate: to, Status: StatusUnconfirmed, RescheduledFrom: &date,
+				// The new date keeps the original's open status: a visit the
+				// customer confirmed stays confirmed.
+				JobID: jobID, OccurrenceDate: to, Status: view.status, RescheduledFrom: &date,
 			}); err != nil {
 				return err
 			}

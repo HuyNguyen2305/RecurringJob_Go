@@ -115,15 +115,102 @@ func TestE2ECancelingAnOccurrenceCancelsItsWorkOrders(t *testing.T) {
 		}
 	})
 
-	t.Run("confirming or completing leaves the work order alone", func(t *testing.T) {
+	t.Run("confirming leaves the work order alone", func(t *testing.T) {
 		c, _, _ := newClient(t)
 		job := dailyJob(t, c)
 		wo := workOrderFor(t, c, job, today)
 		c.patch("/jobs/"+job+"/occurrences/"+today, `{"status":"confirmed"}`).expect(t, 200)
-		c.patch("/jobs/"+job+"/occurrences/"+today, `{"status":"completed"}`).expect(t, 200)
 		if got := workOrderStatus(t, c, wo); got != "draft" {
 			t.Fatalf("work order is %s, want draft", got)
 		}
+	})
+}
+
+func TestE2EAVisitCannotBeCompletedWithOpenWorkOrders(t *testing.T) {
+	today := civil.Format(civil.Today())
+	complete := `{"status":"completed"}`
+
+	for _, status := range []string{"draft", "scheduled", "in_progress"} {
+		t.Run("a "+status+" work order blocks completing the visit", func(t *testing.T) {
+			c, _, _ := newClient(t)
+			job := dailyJob(t, c)
+			wo := workOrderIn(t, c, job, today, status)
+			refused := c.patch("/jobs/"+job+"/occurrences/"+today, complete).expect(t, 409)
+			refused.envelope(t)
+			if !strings.Contains(refused.raw, wo) {
+				t.Fatalf("the refusal should name the work order: %s", refused.raw)
+			}
+			if got := scheduleStatus(t, c, job, today); got != "unconfirmed" {
+				t.Fatalf("the visit is %s after a refused completion", got)
+			}
+		})
+	}
+
+	t.Run("it completes once the work order is canceled", func(t *testing.T) {
+		c, _, _ := newClient(t)
+		job := dailyJob(t, c)
+		wo := workOrderFor(t, c, job, today)
+		c.patch("/jobs/"+job+"/occurrences/"+today, complete).expect(t, 409)
+		c.patch("/work-orders/"+wo+"/status", `{"status":"canceled"}`).expect(t, 200)
+		c.patch("/jobs/"+job+"/occurrences/"+today, complete).expect(t, 200)
+	})
+
+	t.Run("completing the work order does not complete the visit, and then the visit can be completed", func(t *testing.T) {
+		c, _, _ := newClient(t)
+		job := dailyJob(t, c)
+		wo := workOrderIn(t, c, job, today, "completed")
+		if got := scheduleStatus(t, c, job, today); got != "unconfirmed" {
+			t.Fatalf("completing the work order changed the visit to %s", got)
+		}
+		c.patch("/jobs/"+job+"/occurrences/"+today, complete).expect(t, 200)
+		if got := workOrderStatus(t, c, wo); got != "completed" {
+			t.Fatalf("work order is %s", got)
+		}
+	})
+
+	t.Run("a finished visit takes no new work order, but still takes an invoice", func(t *testing.T) {
+		c, _, _ := newClient(t)
+		job := dailyJob(t, c)
+		c.patch("/jobs/"+job+"/occurrences/"+today, complete).expect(t, 200)
+		c.post("/jobs/"+job+"/occurrences/"+today+"/work-order", `{}`).expect(t, 409).envelope(t)
+		c.post("/jobs/"+job+"/occurrences/"+today+"/invoice", draftBody).expect(t, 200)
+	})
+
+	t.Run("a visit with only other visits' work orders completes", func(t *testing.T) {
+		c, _, _ := newClient(t)
+		job, other := dailyJob(t, c), dailyJob(t, c)
+		workOrderFor(t, c, other, today)
+		c.patch("/jobs/"+job+"/occurrences/"+today, complete).expect(t, 200)
+	})
+}
+
+func TestE2EAWorkOrderCannotStartBeforeItsVisitDate(t *testing.T) {
+	c, _, _ := newClient(t)
+	soonDate := civil.Format(civil.AddDays(civil.Today(), 3))
+	// The first occurrence of a future job is available, so it can take a work order.
+	job := c.post("/jobs", `{"date":"`+soonDate+`"}`).expect(t, 200).obj()["id"].(string)
+	wo := workOrderFor(t, c, job, soonDate)
+
+	c.patch("/work-orders/"+wo+"/status", `{"status":"scheduled"}`).expect(t, 200) // planning ahead is fine
+	started := c.patch("/work-orders/"+wo+"/status", `{"status":"in_progress"}`).expect(t, 409)
+	started.envelope(t)
+	if !strings.Contains(started.raw, soonDate) {
+		t.Fatalf("the refusal should give the visit date: %s", started.raw)
+	}
+	if got := workOrderStatus(t, c, wo); got != "scheduled" {
+		t.Fatalf("a refused start changed the status to %s", got)
+	}
+	c.patch("/work-orders/"+wo+"/status", `{"status":"canceled"}`).expect(t, 200) // canceling is fine too
+
+	t.Run("the date rule follows the tenant's calendar", func(t *testing.T) {
+		c, _, _ := newClient(t)
+		// A zone far ahead of UTC makes "today" a day later than the UTC date.
+		set := c.put("/settings", `{"timezone":"Pacific/Kiritimati"}`).expect(t, 200).obj()
+		tenantToday := set["today"].(string)
+		job := c.post("/jobs", `{"date":"`+tenantToday+`"}`).expect(t, 200).obj()["id"].(string)
+		id := workOrderIn(t, c, job, tenantToday, "in_progress")
+		c.patch("/work-orders/"+id, `{"tasks":[{"description":"a","done":true}]}`).expect(t, 200)
+		c.patch("/work-orders/"+id+"/status", `{"status":"completed"}`).expect(t, 200)
 	})
 }
 

@@ -38,12 +38,14 @@ func TestE2ESettingsAndTenantToday(t *testing.T) {
 
 	// Approving needs a job date of today or later, where today is the
 	// tenant's date. Two zones a day or more apart prove it follows the zone.
-	approveOn := func(date string) resp {
-		id := c.post("/estimates", draftBody).expect(t, 200).obj()["id"].(string)
-		return c.post("/estimates/"+id+"/approve", fmt.Sprintf(`{"date":%q}`, date))
-	}
+	// Approving creates a job, which locks the zone, so each zone gets its own tenant.
 	for _, zone := range []string{"Pacific/Kiritimati", "Etc/GMT+12", "Asia/Kolkata", "UTC"} {
 		t.Run("approval follows "+zone, func(t *testing.T) {
+			c, _, _ := newClient(t)
+			approveOn := func(date string) resp {
+				id := c.post("/estimates", draftBody).expect(t, 200).obj()["id"].(string)
+				return c.post("/estimates/"+id+"/approve", fmt.Sprintf(`{"date":%q}`, date))
+			}
 			set := c.put("/settings", fmt.Sprintf(`{"timezone":%q}`, zone)).expect(t, 200)
 			set.envelope(t)
 			today, err := civil.Parse(set.obj()["today"].(string))
@@ -57,6 +59,24 @@ func TestE2ESettingsAndTenantToday(t *testing.T) {
 			approveOn(civil.Format(today)).expect(t, 200)
 		})
 	}
+}
+
+func TestE2ETimezoneIsLockedOnceThereAreJobs(t *testing.T) {
+	c, _, _ := newClient(t)
+	c.put("/settings", `{"timezone":"Asia/Kolkata"}`).expect(t, 200) // no jobs yet: free to change
+	c.put("/settings", `{"timezone":"Asia/Tokyo"}`).expect(t, 200)
+
+	c.post("/jobs", `{"date":"2026-10-02"}`).expect(t, 200)
+
+	refused := c.put("/settings", `{"timezone":"UTC"}`).expect(t, 409)
+	refused.envelope(t)
+	if got := c.get("/settings").expect(t, 200).obj()["timezone"]; got != "Asia/Tokyo" {
+		t.Fatalf("a refused change moved the zone to %v", got)
+	}
+	// Saving the same zone again is not a change.
+	c.put("/settings", `{"timezone":"Asia/Tokyo"}`).expect(t, 200)
+	// A bad zone is still a 400, not a 409.
+	c.put("/settings", `{"timezone":"Mars/Base"}`).expect(t, 400)
 }
 
 func TestE2ESettingsAreTenantScoped(t *testing.T) {

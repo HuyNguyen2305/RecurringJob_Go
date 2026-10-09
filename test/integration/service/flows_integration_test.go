@@ -163,14 +163,22 @@ func TestIntegrationOverdueGating(t *testing.T) {
 		}
 	}
 
-	if got, want := schedule(), []view{{f(day(-3)), "overdue", "unconfirmed"}}; !reflect.DeepEqual(got, want) {
+	// Everything after the overdue visit is listed, but locked (hollow).
+	rest := func(from int) []view {
+		out := []view{}
+		for n := from; n < 7; n++ {
+			out = append(out, view{f(day(n)), "hollow", "unconfirmed"})
+		}
+		return out
+	}
+	if got, want := schedule(), append([]view{{f(day(-3)), "overdue", "unconfirmed"}}, rest(-2)...); !reflect.DeepEqual(got, want) {
 		t.Fatalf("got %v want %v", got, want)
 	}
 	if _, err := svc.UpdateOccurrence(ctx, job.ID, day(-2), service.UpdateOccurrenceRequest{Status: service.StatusCompleted}); !is409(err) {
 		t.Fatalf("a later occurrence behind an overdue one must be refused: %v", err)
 	}
 	complete(day(-3))
-	if got, want := schedule(), []view{{f(day(-3)), "real", "completed"}, {f(day(-2)), "overdue", "unconfirmed"}}; !reflect.DeepEqual(got, want) {
+	if got, want := schedule(), append([]view{{f(day(-3)), "real", "completed"}, {f(day(-2)), "overdue", "unconfirmed"}}, rest(-1)...); !reflect.DeepEqual(got, want) {
 		t.Fatalf("got %v want %v", got, want)
 	}
 	complete(day(-2))

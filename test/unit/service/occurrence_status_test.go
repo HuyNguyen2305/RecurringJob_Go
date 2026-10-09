@@ -93,12 +93,12 @@ func TestValidateJobCreateStatus(t *testing.T) {
 }
 
 func TestValidateJobCreateStatusAll(t *testing.T) {
-	for _, s := range []string{service.StatusUnconfirmed, service.StatusConfirmed, service.StatusCompleted, service.StatusCanceled, service.StatusTerminateService} {
+	for _, s := range []string{service.StatusUnconfirmed, service.StatusConfirmed} {
 		if err := service.ValidateJobCreateStatus(s); err != nil {
 			t.Errorf("%s: %v", s, err)
 		}
 	}
-	for _, s := range []string{service.StatusRescheduled, "in_progress", "UNCONFIRMED", " confirmed", "done"} {
+	for _, s := range []string{service.StatusCompleted, service.StatusCanceled, service.StatusTerminateService, service.StatusRescheduled, "in_progress", "UNCONFIRMED", " confirmed", "done"} {
 		if got := statusOf(t, service.ValidateJobCreateStatus(s)); got != 400 {
 			t.Errorf("%q: status %d, want 400", s, got)
 		}

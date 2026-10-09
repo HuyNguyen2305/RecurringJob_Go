@@ -73,13 +73,15 @@ func EffectiveStatus(jobStatus string, first bool) string {
 	return StatusUnconfirmed
 }
 
-// ValidateJobCreateStatus rejects statuses a new job may not start with.
+// ValidateJobCreateStatus rejects statuses a new job may not start with: a job
+// starts open, and is completed, canceled, terminated or rescheduled through
+// its occurrences.
 func ValidateJobCreateStatus(s string) error {
-	if s == StatusRescheduled {
-		return apperror.Validation("a job cannot be created as rescheduled")
-	}
 	if !IsKnownStatus(s) {
 		return apperror.Validation("unknown status")
+	}
+	if !IsOpen(s) {
+		return apperror.Validation("a job can only be created as unconfirmed or confirmed")
 	}
 	return nil
 }

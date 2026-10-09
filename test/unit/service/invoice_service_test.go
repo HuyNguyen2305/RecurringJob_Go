@@ -20,6 +20,8 @@ type fakeAvailability struct {
 	jobID  string
 	date   time.Time
 	err    error
+	// openErr is what OpenFor adds on top of AvailableFor (a completed visit).
+	openErr error
 }
 
 func (f *fakeAvailability) AvailableFor(_ context.Context, jobID string, date time.Time) error {
@@ -28,6 +30,14 @@ func (f *fakeAvailability) AvailableFor(_ context.Context, jobID string, date ti
 		*f.events = append(*f.events, "available")
 	}
 	return f.err
+}
+
+// OpenFor is the check work orders use: availability, and not completed.
+func (f *fakeAvailability) OpenFor(ctx context.Context, jobID string, date time.Time) error {
+	if err := f.AvailableFor(ctx, jobID, date); err != nil {
+		return err
+	}
+	return f.openErr
 }
 
 func TestInvoiceCreate(t *testing.T) {
@@ -118,6 +128,90 @@ func TestInvoiceCreate(t *testing.T) {
 	})
 }
 
+// fakeEstimateLines serves the line items of a job's estimate.
+type fakeEstimateLines struct {
+	lines []model.CustomerLineItem
+	err   error
+	asked []string
+}
+
+func (f *fakeEstimateLines) LineItemsForJob(_ context.Context, jobID string) ([]model.CustomerLineItem, error) {
+	f.asked = append(f.asked, jobID)
+	return f.lines, f.err
+}
+
+func TestInvoiceCreateStartsFromTheJobsEstimate(t *testing.T) {
+	ctx := context.Background()
+	jobID := uid("a5")
+	rule := recurrenceDaily()
+	estimate := []model.CustomerLineItem{
+		{ID: "x1", ParentID: "est", Position: 4, Description: "Window cleaning", Quantity: 2, UnitPriceCents: 7500},
+		{ID: "x2", ParentID: "est", Position: 9, Description: "Gutter check", Quantity: 1, UnitPriceCents: 2500},
+	}
+	create := func(t *testing.T, est *fakeEstimateLines, in service.DocumentInput) (*model.CustomerDocument, *memDocs, error) {
+		t.Helper()
+		store := newMemDocs()
+		s := service.NewInvoiceService(store, mockJobs{jobID: withRefs(recJob(jobID, "2026-10-02", rule))}, &fakeAvailability{})
+		if est != nil {
+			s.WithEstimates(est)
+		}
+		doc, err := s.Create(ctx, jobID, dt("2026-10-05"), in)
+		return doc, store, err
+	}
+
+	t.Run("no line items given: the estimate's lines are copied, renumbered, without their ids", func(t *testing.T) {
+		est := &fakeEstimateLines{lines: estimate}
+		doc, _, err := create(t, est, service.DocumentInput{Notes: "n"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(doc.LineItems) != 2 || doc.TotalCents() != 17500 {
+			t.Fatalf("lines %+v", doc.LineItems)
+		}
+		for i, l := range doc.LineItems {
+			if l.Position != i || l.ID != "" || l.ParentID != "" || l.Description != estimate[i].Description || l.Quantity != estimate[i].Quantity || l.UnitPriceCents != estimate[i].UnitPriceCents {
+				t.Errorf("line %d: %+v", i, l)
+			}
+		}
+		if doc.Notes != "n" || !reflect.DeepEqual(est.asked, []string{jobID}) {
+			t.Errorf("notes=%q asked=%v", doc.Notes, est.asked)
+		}
+	})
+
+	t.Run("lines in the request win and the estimate is not even consulted", func(t *testing.T) {
+		est := &fakeEstimateLines{lines: estimate}
+		doc, _, err := create(t, est, service.DocumentInput{LineItems: []service.LineItemInput{{Description: "Extra", Quantity: 1, UnitPriceCents: 100}}})
+		if err != nil || len(doc.LineItems) != 1 || doc.LineItems[0].Description != "Extra" || len(est.asked) != 0 {
+			t.Fatalf("lines=%+v err=%v asked=%v", doc.LineItems, err, est.asked)
+		}
+	})
+
+	t.Run("an explicit empty list means an empty draft", func(t *testing.T) {
+		est := &fakeEstimateLines{lines: estimate}
+		doc, _, err := create(t, est, service.DocumentInput{LineItems: []service.LineItemInput{}})
+		if err != nil || len(doc.LineItems) != 0 || len(est.asked) != 0 {
+			t.Fatalf("lines=%+v err=%v asked=%v", doc.LineItems, err, est.asked)
+		}
+	})
+
+	t.Run("a job without an estimate, or a service without the lookup, starts empty", func(t *testing.T) {
+		if doc, _, err := create(t, &fakeEstimateLines{}, service.DocumentInput{}); err != nil || len(doc.LineItems) != 0 {
+			t.Errorf("no estimate: lines=%+v err=%v", doc.LineItems, err)
+		}
+		if doc, _, err := create(t, nil, service.DocumentInput{}); err != nil || len(doc.LineItems) != 0 {
+			t.Errorf("no lookup: lines=%+v err=%v", doc.LineItems, err)
+		}
+	})
+
+	t.Run("a failing lookup saves nothing and comes back as is", func(t *testing.T) {
+		boom := errors.New("db down")
+		_, store, err := create(t, &fakeEstimateLines{err: boom}, service.DocumentInput{})
+		if !errors.Is(err, boom) || len(store.docs) != 0 {
+			t.Fatalf("err=%v saved=%d", err, len(store.docs))
+		}
+	})
+}
+
 func TestInvoiceOccurrenceLookups(t *testing.T) {
 	ctx := context.Background()
 	jobID := uid("a1")
@@ -149,6 +243,25 @@ func TestInvoiceOccurrenceLookups(t *testing.T) {
 		}
 		if ok, err := s.HasPaidForJob(ctx, jobID); err != nil || !ok || store.existsStatus != "paid" {
 			t.Fatalf("ok=%v err=%v status=%s", ok, err, store.existsStatus)
+		}
+	})
+
+	t.Run("an invoice that was paid and then refunded still counts as paid", func(t *testing.T) {
+		for name, c := range map[string]struct {
+			byStatus map[string]bool
+			want     bool
+			asked    []string
+		}{
+			"paid":     {map[string]bool{"paid": true}, true, []string{"paid"}},
+			"refunded": {map[string]bool{"refunded": true}, true, []string{"paid", "refunded"}},
+			"neither":  {map[string]bool{"sent": true, "void": true}, false, []string{"paid", "refunded"}},
+		} {
+			store := newMemDocs()
+			store.existsByStatus = c.byStatus
+			s := service.NewInvoiceService(store, mockJobs{}, nopAvailability{})
+			if got, err := s.HasPaidForJob(ctx, jobID); err != nil || got != c.want || !reflect.DeepEqual(store.existsAsked, c.asked) {
+				t.Errorf("%s: got=%v err=%v asked=%v", name, got, err, store.existsAsked)
+			}
 		}
 	})
 

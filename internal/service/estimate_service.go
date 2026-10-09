@@ -41,8 +41,8 @@ type ApproveEstimateInput struct {
 	Recurrence    *recurrence.Rule
 }
 
-// PaidInvoiceChecker tells whether a job has a paid invoice. InvoiceService
-// satisfies it.
+// PaidInvoiceChecker tells whether a job has an invoice that was ever paid
+// (paid, or paid and then refunded). InvoiceService satisfies it.
 type PaidInvoiceChecker interface {
 	HasPaidForJob(ctx context.Context, jobID string) (bool, error)
 }
@@ -248,7 +248,7 @@ func (s *EstimateService) checkEdit(ctx context.Context, doc *model.CustomerDocu
 		return err
 	}
 	if paid {
-		return apperror.Conflict("an invoice for this estimate's job has been paid, so the estimate can no longer be edited")
+		return apperror.Conflict("an invoice for this estimate's job has been paid (a refund does not undo that), so the estimate can no longer be edited")
 	}
 	return nil
 }

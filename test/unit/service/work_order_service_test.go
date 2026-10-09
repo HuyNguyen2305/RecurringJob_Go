@@ -224,7 +224,9 @@ func TestWorkOrderLifecycle(t *testing.T) {
 	ctx := context.Background()
 	jobID := uid("a3")
 	store := newMemWorkOrders()
-	s := service.NewWorkOrderService(store, mockJobs{jobID: withRefs(recJob(jobID, "2026-10-02", recurrenceDaily()))}, &fakeAvailability{})
+	// The visits below are on the 5th; the clock is after that, so work may start.
+	s := service.NewWorkOrderService(store, mockJobs{jobID: withRefs(recJob(jobID, "2026-10-02", recurrenceDaily()))}, &fakeAvailability{}).
+		WithClock(func() time.Time { return time.Date(2026, 10, 10, 12, 0, 0, 0, time.UTC) })
 	create := func(tasks ...service.TaskInput) string {
 		wo, err := s.Create(ctx, jobID, dt("2026-10-05"), service.WorkOrderInput{Tasks: tasks})
 		if err != nil {
@@ -436,4 +438,110 @@ func TestWorkOrderFollowsItsOccurrence(t *testing.T) {
 			t.Errorf("count %d err=%v", n, err)
 		}
 	})
+}
+
+func TestWorkOrderCannotStartOrCompleteBeforeItsVisit(t *testing.T) {
+	ctx := context.Background()
+	jobID := uid("a6")
+	visit := dt("2026-10-05")
+	oneTask := service.WorkOrderInput{Tasks: []service.TaskInput{{Description: "a", Done: true}}}
+	// at builds a service whose clock is at the given UTC time and, when
+	// tenantToday is set, whose tenant calendar says so.
+	at := func(now string, tenantToday *time.Time) (*service.WorkOrderService, string) {
+		t.Helper()
+		store := newMemWorkOrders()
+		s := service.NewWorkOrderService(store, mockJobs{jobID: withRefs(recJob(jobID, "2026-10-02", recurrenceDaily()))}, &fakeAvailability{}).
+			WithClock(func() time.Time { v, _ := time.Parse(time.RFC3339, now); return v })
+		if tenantToday != nil {
+			s.WithToday(fakeToday{day: *tenantToday})
+		}
+		wo, err := s.Create(ctx, jobID, visit, oneTask)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.ChangeStatus(ctx, wo.ID, service.WOStatusScheduled); err != nil {
+			t.Fatalf("scheduling is allowed at any time: %v", err)
+		}
+		return s, wo.ID
+	}
+
+	t.Run("before the visit date it can be scheduled and canceled but not started", func(t *testing.T) {
+		s, id := at("2026-10-04T12:00:00Z", nil)
+		_, err := s.ChangeStatus(ctx, id, service.WOStatusInProgress)
+		if statusOf(t, err) != 409 || !strings.Contains(err.Error(), "started") || !strings.Contains(err.Error(), "2026-10-05") {
+			t.Fatalf("start: %v", err)
+		}
+		if got, _ := s.Get(ctx, id); got.Status != service.WOStatusScheduled {
+			t.Fatalf("a refused start changed the status to %s", got.Status)
+		}
+		if _, err := s.ChangeStatus(ctx, id, service.WOStatusCanceled); err != nil {
+			t.Fatalf("cancel: %v", err)
+		}
+	})
+
+	t.Run("on the visit date it can be started and completed", func(t *testing.T) {
+		s, id := at("2026-10-05T00:30:00Z", nil)
+		for _, to := range []string{service.WOStatusInProgress, service.WOStatusCompleted} {
+			if _, err := s.ChangeStatus(ctx, id, to); err != nil {
+				t.Fatalf("to %s: %v", to, err)
+			}
+		}
+	})
+
+	t.Run("completing is refused before the date even when it was already started", func(t *testing.T) {
+		store := newMemWorkOrders()
+		s := service.NewWorkOrderService(store, mockJobs{jobID: withRefs(recJob(jobID, "2026-10-02", recurrenceDaily()))}, &fakeAvailability{}).
+			WithClock(func() time.Time { return time.Date(2026, 10, 4, 12, 0, 0, 0, time.UTC) })
+		wo, err := s.Create(ctx, jobID, visit, oneTask)
+		if err != nil {
+			t.Fatal(err)
+		}
+		store.orders[wo.ID].Status = service.WOStatusInProgress // e.g. the visit was rescheduled later
+		_, err = s.ChangeStatus(ctx, wo.ID, service.WOStatusCompleted)
+		if statusOf(t, err) != 409 || !strings.Contains(err.Error(), "completed") {
+			t.Fatalf("complete: %v", err)
+		}
+	})
+
+	t.Run("today is the tenant's calendar date, not the UTC one", func(t *testing.T) {
+		// 2026-10-04 23:00Z is already the 5th in a zone ahead of UTC...
+		ahead := dt("2026-10-05")
+		s, id := at("2026-10-04T23:00:00Z", &ahead)
+		if _, err := s.ChangeStatus(ctx, id, service.WOStatusInProgress); err != nil {
+			t.Fatalf("ahead of UTC: %v", err)
+		}
+		// ... and 2026-10-05 02:00Z is still the 4th in a zone behind it.
+		behind := dt("2026-10-04")
+		s, id = at("2026-10-05T02:00:00Z", &behind)
+		if _, err := s.ChangeStatus(ctx, id, service.WOStatusInProgress); statusOf(t, err) != 409 {
+			t.Fatalf("behind UTC: %v", err)
+		}
+	})
+
+	t.Run("a failing today provider comes back as is", func(t *testing.T) {
+		boom := errors.New("db down")
+		store := newMemWorkOrders()
+		s := service.NewWorkOrderService(store, mockJobs{jobID: withRefs(recJob(jobID, "2026-10-02", recurrenceDaily()))}, &fakeAvailability{}).
+			WithToday(fakeToday{err: boom})
+		wo, err := s.Create(ctx, jobID, visit, oneTask)
+		if err != nil {
+			t.Fatal(err)
+		}
+		store.orders[wo.ID].Status = service.WOStatusScheduled
+		if _, err := s.ChangeStatus(ctx, wo.ID, service.WOStatusInProgress); !errors.Is(err, boom) {
+			t.Fatalf("got %v", err)
+		}
+	})
+}
+
+func TestWorkOrderIsNotCreatedOnAFinishedVisit(t *testing.T) {
+	ctx := context.Background()
+	jobID := uid("a7")
+	boom := apperror.Conflict("occurrence is completed")
+	store := newMemWorkOrders()
+	occs := &fakeAvailability{openErr: boom}
+	s := service.NewWorkOrderService(store, mockJobs{jobID: withRefs(recJob(jobID, "2026-10-02", recurrenceDaily()))}, occs)
+	if _, err := s.Create(ctx, jobID, dt("2026-10-05"), service.WorkOrderInput{}); !errors.Is(err, boom) || len(store.orders) != 0 {
+		t.Fatalf("err=%v saved=%d", err, len(store.orders))
+	}
 }

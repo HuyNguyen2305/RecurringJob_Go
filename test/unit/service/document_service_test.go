@@ -30,20 +30,24 @@ type memDocs struct {
 	occErr       error
 	idsStatus    string
 	existsStatus string
-	lastAllowed  []string
-	events       []string // LockOccurrence calls, in order
-	lockErr      error
-	moveCalls    []moveCall
-	movedN       int64
-	listFilter   model.DocumentFilter
-	deleted      []string
-	deleteRows   int64 // -1: report 0 rows (lost the race)
-	countN       int64
-	revisions    []model.DocumentRevision
-	revisionErr  error
-	reopened     []string
-	lastUpdates  map[string]any
-	listArgs     struct {
+	// existsAsked lists every status ExistsForJob was asked about; existsByStatus,
+	// when set, answers per status instead of hasPaid.
+	existsAsked    []string
+	existsByStatus map[string]bool
+	lastAllowed    []string
+	events         []string // LockOccurrence calls, in order
+	lockErr        error
+	moveCalls      []moveCall
+	movedN         int64
+	listFilter     model.DocumentFilter
+	deleted        []string
+	deleteRows     int64 // -1: report 0 rows (lost the race)
+	countN         int64
+	revisions      []model.DocumentRevision
+	revisionErr    error
+	reopened       []string
+	lastUpdates    map[string]any
+	listArgs       struct {
 		status        string
 		limit, offset int
 	}
@@ -393,6 +397,10 @@ func (m *memDocs) IDsForOccurrence(_ context.Context, _ string, _ time.Time, sta
 
 func (m *memDocs) ExistsForJob(_ context.Context, _, status string) (bool, error) {
 	m.existsStatus = status
+	m.existsAsked = append(m.existsAsked, status)
+	if m.existsByStatus != nil {
+		return m.existsByStatus[status], m.occErr
+	}
 	return m.hasPaid, m.occErr
 }
 

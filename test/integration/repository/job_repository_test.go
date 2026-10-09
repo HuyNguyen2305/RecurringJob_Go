@@ -30,6 +30,24 @@ func pgCode(err error) string {
 	return ""
 }
 
+func TestJobRepositoryCount(t *testing.T) {
+	db, ctx := helpers.NewTestDB(t)
+	jobs := repository.NewJobRepository(db)
+	if n, err := jobs.Count(ctx); err != nil || n != 0 {
+		t.Fatalf("empty tenant: n=%d err=%v", n, err)
+	}
+	helpers.SeedJob(t, ctx, db, fixtures.OneOffJob(civil.New(2026, 10, 2)))
+	helpers.SeedJob(t, ctx, db, fixtures.DailyJob(civil.New(2026, 10, 3)))
+	if n, err := jobs.Count(ctx); err != nil || n != 2 {
+		t.Fatalf("n=%d err=%v", n, err)
+	}
+	// Another tenant's jobs are not counted.
+	_, otherCtx := helpers.NewSchema(t, db)
+	if n, err := jobs.Count(otherCtx); err != nil || n != 0 {
+		t.Fatalf("other tenant: n=%d err=%v", n, err)
+	}
+}
+
 func TestJobRepositoryCreateAndGet(t *testing.T) {
 	db, ctx := helpers.NewTestDB(t)
 	jobs := repository.NewJobRepository(db)

@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -240,11 +242,15 @@ func TestUpdateOccurrence(t *testing.T) {
 		if _, err := s.UpdateOccurrence(ctx, "00000000-0000-0000-0000-00000000000b", dt("2026-10-05"), service.UpdateOccurrenceRequest{Status: service.StatusRescheduled, RescheduledTo: dp("2026-10-06")}); err != nil {
 			t.Fatal(err)
 		}
+		// The 5th was confirmed before it moved, so the 6th is confirmed too.
+		if moved := repo.byDate("2026-10-06"); moved == nil || moved.Status != service.StatusConfirmed {
+			t.Fatalf("a rescheduled visit keeps its status: %+v", moved)
+		}
 		items, err := s.Schedule(ctx, "00000000-0000-0000-0000-00000000000b", service.ScheduleQuery{Limit: 4})
 		if err != nil {
 			t.Fatal(err)
 		}
-		want := []brief{{"2026-10-02", service.StateReal, "rescheduled"}, {"2026-10-05", service.StateReal, "rescheduled"}, {"2026-10-06", service.StateReal, "unconfirmed"}, {"2026-10-09", service.StateHollow, "unconfirmed"}}
+		want := []brief{{"2026-10-02", service.StateReal, "rescheduled"}, {"2026-10-05", service.StateReal, "rescheduled"}, {"2026-10-06", service.StateReal, "confirmed"}, {"2026-10-09", service.StateHollow, "unconfirmed"}}
 		if got := summarize(items); len(got) != len(want) || got[0] != want[0] || got[1] != want[1] || got[2] != want[2] || got[3] != want[3] {
 			t.Fatalf("got  %v\nwant %v", got, want)
 		}
@@ -352,13 +358,18 @@ func TestSchedule(t *testing.T) {
 		}
 	})
 
-	t.Run("overdue occurrence ends the schedule", func(t *testing.T) {
+	t.Run("an overdue occurrence stays first; the visits after it are listed but locked", func(t *testing.T) {
 		j := recJob("00000000-0000-0000-0000-00000000000a", "2026-09-29", recurrence.Rule{Frequency: "daily"})
 		j.Status = service.StatusUnconfirmed
 		s, _ := newService(mockJobs{"00000000-0000-0000-0000-00000000000a": j})
 		items, err := s.Schedule(ctx, "00000000-0000-0000-0000-00000000000a", service.ScheduleQuery{Limit: 10})
-		if err != nil || len(items) != 1 || items[0].State != service.StateOverdue {
+		if err != nil || len(items) != 10 || items[0].State != service.StateOverdue || items[0].Date != "2026-09-29" {
 			t.Fatalf("items=%v err=%v", items, err)
+		}
+		for i, it := range items[1:] {
+			if it.State != service.StateHollow || it.Status != service.StatusUnconfirmed {
+				t.Fatalf("item %d (%+v) must be hollow and unconfirmed", i+1, it)
+			}
 		}
 	})
 
@@ -1198,7 +1209,8 @@ func TestCancelingOrTerminatingAnOccurrenceVoidsItsInvoices(t *testing.T) {
 type fakeWorkOrders struct {
 	canceled                   []voidCall
 	moved                      []moveCall
-	kept                       []string
+	kept                       []string // answers a question about completed / in-progress work orders
+	open                       []string // answers a question that includes the draft status
 	cancelErr, moveErr, idsErr error
 	idsAsked                   [][]string
 }
@@ -1215,6 +1227,9 @@ func (f *fakeWorkOrders) MoveOpenForOccurrence(_ context.Context, jobID string, 
 
 func (f *fakeWorkOrders) IDsForOccurrence(_ context.Context, _ string, _ time.Time, statuses []string) ([]string, error) {
 	f.idsAsked = append(f.idsAsked, statuses)
+	if slices.Contains(statuses, service.WOStatusDraft) {
+		return f.open, f.idsErr
+	}
 	return f.kept, f.idsErr
 }
 
@@ -1263,15 +1278,51 @@ func TestAnOccurrenceChangeCarriesItsWorkOrdersAlong(t *testing.T) {
 		}
 	})
 
-	t.Run("other status changes leave work orders alone", func(t *testing.T) {
-		for _, status := range []string{service.StatusConfirmed, service.StatusCompleted} {
-			s, _ := newService(newJob())
-			wo := &fakeWorkOrders{kept: []string{"wo-1"}}
-			s.WithWorkOrders(wo)
-			saved, err := s.UpdateOccurrence(ctx, jobID, dt("2026-10-02"), upd(status))
-			if err != nil || len(wo.canceled)+len(wo.moved)+len(wo.idsAsked) != 0 || len(saved.KeptWorkOrderIDs) != 0 {
-				t.Errorf("%s: err=%v wo=%+v saved=%+v", status, err, wo, saved)
-			}
+	t.Run("confirming leaves work orders alone", func(t *testing.T) {
+		s, _ := newService(newJob())
+		wo := &fakeWorkOrders{kept: []string{"wo-1"}, open: []string{"wo-2"}}
+		s.WithWorkOrders(wo)
+		saved, err := s.UpdateOccurrence(ctx, jobID, dt("2026-10-02"), upd(service.StatusConfirmed))
+		if err != nil || len(wo.canceled)+len(wo.moved)+len(wo.idsAsked) != 0 || len(saved.KeptWorkOrderIDs) != 0 {
+			t.Errorf("err=%v wo=%+v saved=%+v", err, wo, saved)
+		}
+	})
+
+	t.Run("completing is refused while the visit has open work orders", func(t *testing.T) {
+		s, repo := newService(newJob())
+		wo := &fakeWorkOrders{open: []string{"wo-draft", "wo-busy"}}
+		s.WithWorkOrders(wo)
+		_, err := s.UpdateOccurrence(ctx, jobID, dt("2026-10-02"), upd(service.StatusCompleted))
+		if statusOf(t, err) != 409 || !strings.Contains(err.Error(), "wo-draft") || !strings.Contains(err.Error(), "wo-busy") {
+			t.Fatalf("err=%v", err)
+		}
+		if !reflect.DeepEqual(wo.idsAsked, [][]string{{service.WOStatusDraft, service.WOStatusScheduled, service.WOStatusInProgress}}) {
+			t.Errorf("asked for %v", wo.idsAsked)
+		}
+		if repo.byDate("2026-10-02") != nil || len(wo.canceled)+len(wo.moved) != 0 {
+			t.Error("a refused completion changed something")
+		}
+	})
+
+	t.Run("completing goes through once the work orders are done or canceled, and touches none", func(t *testing.T) {
+		s, repo := newService(newJob())
+		wo := &fakeWorkOrders{kept: []string{"wo-done"}} // only a completed one is left
+		s.WithWorkOrders(wo)
+		saved, err := s.UpdateOccurrence(ctx, jobID, dt("2026-10-02"), upd(service.StatusCompleted))
+		if err != nil || repo.byDate("2026-10-02") == nil || repo.byDate("2026-10-02").Status != service.StatusCompleted {
+			t.Fatalf("err=%v saved=%+v", err, saved)
+		}
+		if len(wo.canceled)+len(wo.moved) != 0 || len(saved.KeptWorkOrderIDs) != 0 {
+			t.Errorf("work orders were touched: %+v %+v", wo, saved)
+		}
+	})
+
+	t.Run("a failing lookup stops the completion", func(t *testing.T) {
+		boom := errors.New("db down")
+		s, repo := newService(newJob())
+		s.WithWorkOrders(&fakeWorkOrders{idsErr: boom})
+		if _, err := s.UpdateOccurrence(ctx, jobID, dt("2026-10-02"), upd(service.StatusCompleted)); !errors.Is(err, boom) || repo.byDate("2026-10-02") != nil {
+			t.Fatalf("err=%v", err)
 		}
 	})
 

@@ -1,6 +1,7 @@
 package migrator_test
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -14,7 +15,7 @@ import (
 )
 
 // realMigrations are the files in the repository's migrations folder, in order.
-var realMigrations = []string{"0001_reference_data.sql", "0002_jobs_and_occurrences.sql", "0003_customer_documents.sql", "0004_tenant_settings.sql", "0005_document_lifecycle.sql", "0006_work_orders.sql", "0007_remove_in_progress.sql"}
+var realMigrations = []string{"0001_reference_data.sql", "0002_jobs_and_occurrences.sql", "0003_customer_documents.sql", "0004_tenant_settings.sql", "0005_document_lifecycle.sql", "0006_work_orders.sql", "0007_remove_in_progress.sql", "0008_gapless_invoice_numbers.sql"}
 
 func TestMain(m *testing.M) {
 	helpers.ApplyLocalTZ()
@@ -155,16 +156,29 @@ func copyMigration(t *testing.T, dir, name string) {
 	writeSQL(t, dir, name, string(sql))
 }
 
-func TestRemoveInProgressMigration(t *testing.T) {
-	db := helpers.Connect(t)
-	schema := newName(t, db)
+// applyBefore applies the real migrations that come before name, in a new
+// schema, and returns the temp dir they were copied to so name can be added
+// and applied on its own.
+func applyBefore(t *testing.T, db *gorm.DB, schema, name string) string {
+	t.Helper()
 	dir := t.TempDir()
-	for _, name := range realMigrations[:len(realMigrations)-1] {
-		copyMigration(t, dir, name)
+	for _, m := range realMigrations {
+		if m == name {
+			break
+		}
+		copyMigration(t, dir, m)
 	}
 	if _, err := migrator.Apply(db, schema, dir); err != nil {
 		t.Fatal(err)
 	}
+	return dir
+}
+
+func TestRemoveInProgressMigration(t *testing.T) {
+	db := helpers.Connect(t)
+	schema := newName(t, db)
+	const migration = "0007_remove_in_progress.sql"
+	dir := applyBefore(t, db, schema, migration)
 
 	// A job and a stored occurrence that are still in_progress before the migration.
 	q := func(format string) string { return strings.ReplaceAll(format, "S.", schema+".") }
@@ -182,9 +196,9 @@ func TestRemoveInProgressMigration(t *testing.T) {
 		}
 	}
 
-	copyMigration(t, dir, realMigrations[len(realMigrations)-1])
+	copyMigration(t, dir, migration)
 	res, err := migrator.Apply(db, schema, dir)
-	if err != nil || !reflect.DeepEqual(res.Applied, []string{"0007_remove_in_progress.sql"}) {
+	if err != nil || !reflect.DeepEqual(res.Applied, []string{migration}) {
 		t.Fatalf("res=%+v err=%v", res, err)
 	}
 
@@ -207,6 +221,150 @@ func TestRemoveInProgressMigration(t *testing.T) {
 	if err := db.Exec(q(`UPDATE S.jobs SET status = 'rescheduled'`)).Error; err == nil {
 		t.Error("jobs accept rescheduled")
 	}
+}
+
+func TestGaplessInvoiceNumbersMigration(t *testing.T) {
+	db := helpers.Connect(t)
+	schema := newName(t, db)
+	const migration = "0008_gapless_invoice_numbers.sql"
+	dir := applyBefore(t, db, schema, migration)
+
+	q := func(format string) string { return strings.ReplaceAll(format, "S.", schema+".") }
+	const (
+		customer = "'00000000-0000-0000-0000-0000000000c1'"
+		location = "'00000000-0000-0000-0000-0000000000a1'"
+		service  = "'00000000-0000-0000-0000-0000000000b1'"
+		job      = "'00000000-0000-0000-0000-0000000000e1'"
+	)
+	exec := func(stmt string) {
+		t.Helper()
+		if err := db.Exec(q(stmt)).Error; err != nil {
+			t.Fatalf("%s: %v", stmt, err)
+		}
+	}
+	invoice := func(status, date, number string) {
+		t.Helper()
+		cols, vals := "", ""
+		if status == "paid" { // a paid invoice carries its paid_at
+			cols, vals = ", paid_at", ", now()"
+		}
+		exec(`INSERT INTO S.customer_documents (type, status, customer_id, location_id, service_type_id, job_id, job_snapshot, occurrence_date, number` + cols + `)
+			VALUES ('invoice', '` + status + `', ` + customer + `, ` + location + `, ` + service + `, ` + job + `, '{"id":"x"}', '` + date + `', ` + number + vals + `)`)
+	}
+	scalar := func(query string) string {
+		t.Helper()
+		var s *string
+		if err := db.Raw(q(query)).Scan(&s).Error; err != nil {
+			t.Fatalf("%s: %v", query, err)
+		}
+		if s == nil {
+			return "<null>"
+		}
+		return *s
+	}
+
+	// Invoices as they were before: numbered at creation, with a hole already in them.
+	exec(`INSERT INTO S.customers (id, name) VALUES (` + customer + `, 'Ada')`)
+	exec(`INSERT INTO S.locations (id, customer_id, address_line1) VALUES (` + location + `, ` + customer + `, '1 Main Street')`)
+	exec(`INSERT INTO S.service_types (id, name) VALUES (` + service + `, 'Window cleaning')`)
+	exec(`INSERT INTO S.jobs (id, customer_id, location_id, service_type_id, date, start_time, length_minutes)
+		VALUES (` + job + `, ` + customer + `, ` + location + `, ` + service + `, '2026-10-01', '09:00', 60)`)
+	invoice("sent", "2026-10-02", "'INV-000003'")
+	invoice("paid", "2026-10-03", "'INV-000007'")
+	invoice("draft", "2026-10-04", "'INV-000005'")
+
+	copyMigration(t, dir, migration)
+	res, err := migrator.Apply(db, schema, dir)
+	if err != nil || !reflect.DeepEqual(res.Applied, []string{migration}) {
+		t.Fatalf("res=%+v err=%v", res, err)
+	}
+
+	t.Run("the counter carries on after the highest existing number", func(t *testing.T) {
+		if got := scalar(`SELECT last_value::text FROM S.document_counters WHERE kind = 'invoice'`); got != "7" {
+			t.Fatalf("counter %s, want 7", got)
+		}
+	})
+
+	t.Run("a new draft has no number; sending gives it the next one", func(t *testing.T) {
+		invoice("draft", "2026-10-05", "NULL")
+		if got := scalar(`SELECT number FROM S.customer_documents WHERE occurrence_date = '2026-10-05'`); got != "<null>" {
+			t.Fatalf("draft number %s", got)
+		}
+		exec(`UPDATE S.customer_documents SET status = 'sent' WHERE occurrence_date = '2026-10-05'`)
+		if got := scalar(`SELECT number FROM S.customer_documents WHERE occurrence_date = '2026-10-05'`); got != "INV-000008" {
+			t.Fatalf("sent number %s, want INV-000008", got)
+		}
+		// Later changes keep it.
+		exec(`UPDATE S.customer_documents SET status = 'paid', paid_at = now() WHERE occurrence_date = '2026-10-05'`)
+		exec(`UPDATE S.customer_documents SET status = 'refunded', refunded_at = now() WHERE occurrence_date = '2026-10-05'`)
+		if got := scalar(`SELECT number FROM S.customer_documents WHERE occurrence_date = '2026-10-05'`); got != "INV-000008" {
+			t.Fatalf("number after paid and refunded: %s", got)
+		}
+	})
+
+	t.Run("a draft that is voided never gets a number, a sent one that is voided keeps it", func(t *testing.T) {
+		invoice("draft", "2026-10-06", "NULL")
+		exec(`UPDATE S.customer_documents SET status = 'void' WHERE occurrence_date = '2026-10-06'`)
+		if got := scalar(`SELECT number FROM S.customer_documents WHERE occurrence_date = '2026-10-06'`); got != "<null>" {
+			t.Fatalf("voided draft number %s", got)
+		}
+		invoice("draft", "2026-10-07", "NULL")
+		exec(`UPDATE S.customer_documents SET status = 'sent' WHERE occurrence_date = '2026-10-07'`)
+		exec(`UPDATE S.customer_documents SET status = 'void' WHERE occurrence_date = '2026-10-07'`)
+		if got := scalar(`SELECT number FROM S.customer_documents WHERE occurrence_date = '2026-10-07'`); got != "INV-000009" {
+			t.Fatalf("voided sent number %s, want INV-000009", got)
+		}
+	})
+
+	t.Run("a failed statement gives the number back: no gap", func(t *testing.T) {
+		before := scalar(`SELECT last_value::text FROM S.document_counters WHERE kind = 'invoice'`)
+		// Sending a second live invoice for an occurrence that already has one
+		// violates the unique index after the number was taken.
+		invoice("draft", "2026-10-08", "NULL")
+		exec(`UPDATE S.customer_documents SET status = 'sent' WHERE occurrence_date = '2026-10-08'`)
+		invoice("draft", "2026-10-09", "NULL")
+		if err := db.Exec(q(`UPDATE S.customer_documents SET status = 'sent', occurrence_date = '2026-10-08' WHERE occurrence_date = '2026-10-09'`)).Error; err == nil {
+			t.Fatal("expected the unique index to refuse a second live invoice")
+		}
+		var beforeN, afterN int
+		_, _ = fmt.Sscan(before, &beforeN)
+		_, _ = fmt.Sscan(scalar(`SELECT last_value::text FROM S.document_counters WHERE kind = 'invoice'`), &afterN)
+		if afterN != beforeN+1 { // only the 2026-10-08 invoice used one
+			t.Fatalf("counter went from %d to %d: the failed send must not use a number", beforeN, afterN)
+		}
+	})
+
+	t.Run("an issued number cannot be changed or cleared", func(t *testing.T) {
+		if err := db.Exec(q(`UPDATE S.customer_documents SET number = 'INV-000099' WHERE number = 'INV-000003'`)).Error; err == nil {
+			t.Error("changing an issued number must be refused")
+		}
+		if err := db.Exec(q(`UPDATE S.customer_documents SET number = NULL WHERE number = 'INV-000003'`)).Error; err == nil {
+			t.Error("clearing an issued number must be refused")
+		}
+		if got := scalar(`SELECT count(*)::text FROM S.customer_documents WHERE number = 'INV-000003'`); got != "1" {
+			t.Errorf("INV-000003 count %s", got)
+		}
+	})
+
+	t.Run("estimates are still numbered on insert, and the invoice sequence is gone", func(t *testing.T) {
+		exec(`INSERT INTO S.customer_documents (type, status, customer_id, location_id, service_type_id) VALUES ('estimate', 'draft', ` + customer + `, ` + location + `, ` + service + `)`)
+		if got := scalar(`SELECT number FROM S.customer_documents WHERE type = 'estimate'`); got != "EST-000001" {
+			t.Errorf("estimate number %s", got)
+		}
+		if got := scalar(`SELECT to_regclass('S.invoice_number_seq')::text`); got != "<null>" {
+			t.Errorf("invoice_number_seq still exists: %s", got)
+		}
+	})
+
+	t.Run("only a draft or a void invoice may lack a number", func(t *testing.T) {
+		if err := db.Exec(q(`INSERT INTO S.customer_documents (type, status, customer_id, location_id, service_type_id, number) VALUES ('estimate', 'draft', ` + customer + `, ` + location + `, ` + service + `, NULL)`)).Error; err != nil {
+			// The trigger numbers it, so this succeeds; the CHECK is what protects a hand-built NULL.
+			t.Fatalf("an estimate without a number is numbered by the trigger: %v", err)
+		}
+		if err := db.Exec(q(`UPDATE S.customer_documents SET number = NULL WHERE type = 'estimate'`)).Error; err == nil {
+			t.Error("an estimate must keep a number")
+		}
+	})
 }
 
 func TestApplyOrderingAndIncrementalFiles(t *testing.T) {

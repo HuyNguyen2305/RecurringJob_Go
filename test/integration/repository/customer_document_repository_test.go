@@ -35,6 +35,63 @@ func appStatus(t *testing.T, err error) int {
 	return ae.Status
 }
 
+func TestEstimateRepositoryLineItemsForJob(t *testing.T) {
+	db, ctx := helpers.NewTestDB(t)
+	r := helpers.RefsFor(t, ctx, db)
+	estimates := repository.NewEstimateRepository(db)
+	invoices := repository.NewInvoiceRepository(db)
+	job := helpers.SeedJob(t, ctx, db, fixtures.DailyJob(civil.New(2026, 10, 1)))
+	other := helpers.SeedJob(t, ctx, db, fixtures.DailyJob(civil.New(2026, 10, 1)))
+
+	t.Run("a job without an estimate has no lines, never nil", func(t *testing.T) {
+		got, err := estimates.LineItemsForJob(ctx, job.ID)
+		if err != nil || got == nil || len(got) != 0 {
+			t.Fatalf("got %#v err=%v", got, err)
+		}
+	})
+
+	est := &model.CustomerDocument{Status: "draft", CustomerID: r.CustomerID, LocationID: r.LocationID, ServiceTypeID: r.ServiceTypeID, LineItems: items("B", "A", "C")}
+	if err := estimates.Create(ctx, est); err != nil {
+		t.Fatal(err)
+	}
+	// Another job's estimate and an invoice of this job must never leak in.
+	otherEst := &model.CustomerDocument{Status: "draft", CustomerID: r.CustomerID, LocationID: r.LocationID, ServiceTypeID: r.ServiceTypeID, LineItems: items("Other")}
+	if err := estimates.Create(ctx, otherEst); err != nil {
+		t.Fatal(err)
+	}
+	for id, j := range map[string]*model.Job{est.ID: job, otherEst.ID: other} {
+		if n, err := estimates.MarkApproved(ctx, id, []string{"draft"}, "approved", j.ID, &model.JobSnapshot{ID: j.ID}); err != nil || n != 1 {
+			t.Fatalf("approve n=%d err=%v", n, err)
+		}
+	}
+	date := civil.New(2026, 10, 1)
+	inv := &model.CustomerDocument{Status: "draft", CustomerID: r.CustomerID, LocationID: r.LocationID, ServiceTypeID: r.ServiceTypeID,
+		JobID: &job.ID, JobSnapshot: &model.JobSnapshot{ID: job.ID}, OccurrenceDate: &date, LineItems: items("Invoice line")}
+	if err := invoices.Create(ctx, inv); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("the job's estimate lines come back in position order", func(t *testing.T) {
+		got, err := estimates.LineItemsForJob(ctx, job.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if want := []string{"B", "A", "C"}; len(got) != 3 || got[0].Description != want[0] || got[1].Description != want[1] || got[2].Description != want[2] {
+			t.Fatalf("got %+v", got)
+		}
+		if got[1].Quantity != 2 || got[1].UnitPriceCents != 200 || got[2].Position != 2 {
+			t.Fatalf("line fields %+v", got)
+		}
+	})
+
+	t.Run("another job's estimate is separate", func(t *testing.T) {
+		got, err := estimates.LineItemsForJob(ctx, other.ID)
+		if err != nil || len(got) != 1 || got[0].Description != "Other" {
+			t.Fatalf("got %+v err=%v", got, err)
+		}
+	})
+}
+
 func TestEstimateRepository(t *testing.T) {
 	db, ctx := helpers.NewTestDB(t)
 	r := helpers.RefsFor(t, ctx, db)

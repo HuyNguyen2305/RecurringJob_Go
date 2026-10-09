@@ -47,6 +47,26 @@ func TestInvoiceHandlerCreate(t *testing.T) {
 		}
 	})
 
+	t.Run("omitted lineItems reach the service as nil, an explicit empty list as empty", func(t *testing.T) {
+		for name, c := range map[string]struct {
+			body    string
+			wantNil bool
+		}{
+			"omitted":        {`{"notes":"n"}`, true},
+			"null":           {`{"lineItems":null}`, true},
+			"empty":          {`{"lineItems":[]}`, false},
+			"with one entry": {`{"lineItems":[{"description":"x","quantity":1}]}`, false},
+		} {
+			f := newFakeDocs()
+			if w := do(invoiceEngine(f), "POST", path, c.body); w.Code != 200 {
+				t.Fatalf("%s: status %d: %s", name, w.Code, w.Body)
+			}
+			if (f.created.LineItems == nil) != c.wantNil {
+				t.Errorf("%s: lines %#v, want nil=%v", name, f.created.LineItems, c.wantNil)
+			}
+		}
+	})
+
 	t.Run("bad requests are 400 and never reach the service", func(t *testing.T) {
 		for name, c := range map[string]struct{ path, body string }{
 			"bad date in the path": {"/jobs/job-1/occurrences/05-10-2026/invoice", `{"notes":"n"}`},

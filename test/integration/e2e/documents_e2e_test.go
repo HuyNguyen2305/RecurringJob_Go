@@ -510,6 +510,10 @@ func TestE2EEstimateStaysEditableUntilAnInvoiceIsPaid(t *testing.T) {
 		t.Fatalf("a refused edit changed the estimate: %v", e)
 	}
 
+	// Refunding the money does not undo that the job was billed and paid.
+	c.patch("/invoices/"+inv+"/status", `{"status":"refunded"}`).expect(t, 200)
+	edit("still closed after the refund", 409).envelope(t)
+
 	t.Run("an unpaid invoice of another job does not close it", func(t *testing.T) {
 		est2 := c.post("/estimates", draftBody).expect(t, 200).obj()["id"].(string)
 		c.patch("/estimates/"+est2+"/status", `{"status":"sent"}`).expect(t, 200)
